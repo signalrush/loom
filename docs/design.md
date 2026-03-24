@@ -358,6 +358,110 @@ asyncio.run(main())
 
 This program runs indefinitely. Each step is a fresh context. The Python loop handles state (best score, count), branching (keep/discard), and periodic replanning. OpenCode handles the actual coding agent work inside each step.
 
+## Integration: Loom as an Agent Skill
+
+### Architecture
+
+```
+opencode serve --port 54321
+       │
+       ├── TUI attaches (interactive view)
+       │
+       ├── loom program.py connects (automated steps)
+       │
+       └── web UI (optional)
+```
+
+The OpenCode server is the brain. The TUI is a window. Loom programs are another client. They share the same backend, tools, and filesystem.
+
+### How it works
+
+The model inside the TUI:
+
+1. **Installs the skill** — `pip install loom-agent` (or it's pre-installed in the environment)
+2. **Reads the skill instructions** — learns how to write `step()` programs
+3. **Writes `program.py`** — a Python script composing `step()` calls
+4. **Runs `loom-run program.py`** — a wrapper script that handles plumbing
+5. **Checks progress** — reads `loom-state.json` or `loom-run status`
+
+### `loom-run` — the wrapper script
+
+```bash
+loom-run program.py    # start a loom program in background
+loom-run status        # show running state, last result
+loom-run log           # tail the output log
+loom-run stop          # kill a running program
+```
+
+What `loom-run` does internally:
+
+1. **Discovers the server port** — reads from `OPENCODE_SERVER_URL` env var, or from OpenCode's config/state files, or accepts `--port` explicitly
+2. **Ensures loom is installed** — `pip install loom-agent` if needed
+3. **Sets `LOOM_SERVER_URL`** — so `step()` connects to the existing server
+4. **Runs program.py in background** — `nohup python program.py > loom.log 2>&1 &`, writes PID to `loom.pid`
+5. **program.py writes progress** — structured state to `loom-state.json`
+
+### State reporting
+
+Programs use a `state` helper to write progress:
+
+```python
+from loom import step, state
+
+async def main():
+    state.set("status", "running")
+    
+    baseline = await step("run train.py", schema={"loss": "float"})
+    state.update({"best_loss": baseline["loss"], "step": 0})
+    
+    for i in range(100):
+        result = await step(
+            "propose and run an experiment",
+            context=state.get(),
+            schema={"loss": "float", "description": "str"}
+        )
+        if result["loss"] < state.get("best_loss"):
+            state.update({"best_loss": result["loss"], "step": i + 1})
+    
+    state.set("status", "done")
+```
+
+The model in the TUI can `cat loom-state.json` at any time to see:
+```json
+{"status": "running", "best_loss": 0.23, "step": 7}
+```
+
+### Steering a running program
+
+The model can steer by:
+
+1. **Kill and restart** — `loom-run stop`, edit `program.py`, `loom-run program.py`
+2. **Edit program.py while running** — if the program re-reads itself (self-rewrite pattern), changes take effect on next iteration
+3. **Write to a control file** — program.py watches `loom-control.json`, model writes directives to it
+
+Option 1 is simplest and sufficient. The program is cheap to restart because state is in files, not in memory.
+
+### What ships as a skill
+
+```
+skills/loom/
+  SKILL.md              # instructions for the model
+  scripts/
+    loom-run            # CLI wrapper (bash)
+  references/
+    program-guide.md    # how to write loom programs
+    examples.md         # example programs
+```
+
+### Why this works
+
+- **No MCP, no special protocol** — just Python + HTTP
+- **No context pollution** — each step() is a fresh session, the TUI stays clean
+- **Model writes the program** — full control over execution flow
+- **Visible state** — JSON files the model can read anytime
+- **Same server** — loom uses the same backend as the TUI, same tools, same filesystem
+- **Steer by restart** — kill, edit, restart is simple and reliable
+
 ## Open Questions
 
 1. ~~**Who writes the program?**~~ **Resolved: the model writes it.** The model generates the `step()` program on its first turn. It can also rewrite the program mid-run — the program is a file, and the model can edit it in any step. The next loop iteration picks up the new version.
