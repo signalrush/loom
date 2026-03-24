@@ -61,6 +61,12 @@ See [`examples/autoresearch.py`](examples/autoresearch.py) — an autonomous res
 - Cross-step state flows through Python variables, not context accumulation
 - Step 1000 is as lucid as step 1
 
+## Docs
+
+- [Quickstart](docs/quickstart.md) — get running in 5 minutes
+- [API Reference](docs/api.md) — full `step()` and `StepRuntime` docs
+- [Design](docs/design.md) — why `step()` works this way
+
 ## License
 
 MIT
