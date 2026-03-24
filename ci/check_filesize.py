@@ -9,7 +9,7 @@ MAX_LINES = 500
 
 def main():
     root = pathlib.Path(__file__).resolve().parent.parent
-    loom_dir = root / "loom"
+    loom_dir = root / "src" / "loom"
     violations = []
 
     for py_file in sorted(loom_dir.rglob("*.py")):

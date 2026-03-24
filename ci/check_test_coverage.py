@@ -7,7 +7,7 @@ import sys
 
 def main():
     root = pathlib.Path(__file__).resolve().parent.parent
-    loom_dir = root / "loom"
+    loom_dir = root / "src" / "loom"
     tests_dir = root / "tests"
     missing = []
 

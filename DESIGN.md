@@ -144,18 +144,6 @@ def solve(task, depth=0):
 
 Recursion is just Python recursion. Depth limit is a variable, not something the model has to remember. Each level gets its own step with fresh context.
 
-### Slate-style Thread Weaving
-
-```python
-episodes = []
-while not done:
-    plan = step("what threads to dispatch?", episodes, schema={"actions": list})
-    new_episodes = [step(action, episodes) for action in plan.actions]
-    episodes.extend(new_episodes)
-```
-
-Episodes are just return values from steps. The orchestrator (the Python code) passes them as context to subsequent steps. No special episode format needed — steps return strings, strings compose.
-
 ### Self-Guardrailing
 
 ```python
@@ -372,15 +360,13 @@ This program runs indefinitely. Each step is a fresh context. The Python loop ha
 
 ## Open Questions
 
-1. **Who writes the program?** The human (like program.md)? The model on its first turn? A planning step that outputs the program?
+1. ~~**Who writes the program?**~~ **Resolved: the model writes it.** The model generates the `step()` program on its first turn. It can also rewrite the program mid-run — the program is a file, and the model can edit it in any step. The next loop iteration picks up the new version.
 
 2. **Error handling.** What happens when a step fails? Python try/except is the obvious answer, but does the model write good error handling?
 
 3. **Context window within a step.** If a single step involves many tool calls, it still faces context accumulation within that step. Step boundaries help but don't eliminate the problem.
 
 4. **Training.** Models aren't specifically trained to write `step()` programs. How much does this matter? Is Python fluency enough, or do you need RL on step-composition specifically?
-
-5. **Parallelism.** `step()` is sequential. For parallel execution, do you need a `parallel()` primitive, or is `asyncio` / threading in Python sufficient?
 
 ## Conclusion
 

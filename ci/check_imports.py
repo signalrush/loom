@@ -8,11 +8,12 @@ import sys
 
 def main():
     root = pathlib.Path(__file__).resolve().parent.parent
-    loom_dir = root / "loom"
+    sys.path.insert(0, str(root / "src"))
+    loom_dir = root / "src" / "loom"
     errors = []
 
     for py_file in sorted(loom_dir.rglob("*.py")):
-        rel = py_file.relative_to(root)
+        rel = py_file.relative_to(root / "src")
         parts = list(rel.with_suffix("").parts)
         if parts[-1] == "__init__":
             parts = parts[:-1]
