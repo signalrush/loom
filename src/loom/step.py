@@ -1,5 +1,6 @@
 import json
 import re
+import os
 from opencode_agent_sdk import SDKClient, AgentOptions, AssistantMessage, TextBlock
 
 
@@ -42,8 +43,8 @@ def _extract_json(text):
 
 
 class StepRuntime:
-    def __init__(self, server_url="http://localhost:54321", cwd="."):
-        self.server_url = server_url
+    def __init__(self, server_url=None, cwd="."):
+        self.server_url = server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")
         self.cwd = cwd
 
     async def step(self, instruction, context=None, schema=None):

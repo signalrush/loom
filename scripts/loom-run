@@ -1,0 +1,224 @@
+#!/bin/bash
+# loom-run: Wrapper script for running loom programs
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOOM_PID_FILE=".loom.pid"
+LOOM_LOG_FILE="loom.log"
+DEFAULT_PORT="54321"
+
+show_help() {
+    cat << EOF
+Usage: loom-run <command> [args...]
+
+Commands:
+    loom-run <program.py> [--port PORT]   Start a loom program in background
+    loom-run status                       Show running state and process status  
+    loom-run log                          Tail the loom.log file
+    loom-run stop                         Kill running program
+
+Environment Variables:
+    OPENCODE_SERVER_URL                   Server URL (e.g., http://localhost:54321)
+    LOOM_SERVER_URL                       Alternative server URL for loom
+
+EOF
+}
+
+get_server_port() {
+    local port=""
+    
+    # Check OPENCODE_SERVER_URL first
+    if [[ -n "${OPENCODE_SERVER_URL:-}" ]]; then
+        port=$(echo "$OPENCODE_SERVER_URL" | sed -n 's|.*://[^:]*:\([0-9]*\).*|\1|p')
+    fi
+    
+    # Check LOOM_SERVER_URL as alternative
+    if [[ -z "$port" && -n "${LOOM_SERVER_URL:-}" ]]; then
+        port=$(echo "$LOOM_SERVER_URL" | sed -n 's|.*://[^:]*:\([0-9]*\).*|\1|p')
+    fi
+    
+    # Fall back to default
+    if [[ -z "$port" ]]; then
+        port="$DEFAULT_PORT"
+    fi
+    
+    echo "$port"
+}
+
+start_program() {
+    local program_file="$1"
+    local port=""
+    
+    # Parse --port flag if provided
+    shift
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --port)
+                port="$2"
+                shift 2
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Get server port
+    if [[ -z "$port" ]]; then
+        port=$(get_server_port)
+    fi
+    
+    if [[ ! -f "$program_file" ]]; then
+        echo "Error: Program file '$program_file' not found" >&2
+        exit 1
+    fi
+    
+    # Check if already running
+    if [[ -f "$LOOM_PID_FILE" ]]; then
+        local old_pid
+        old_pid=$(cat "$LOOM_PID_FILE")
+        if kill -0 "$old_pid" 2>/dev/null; then
+            echo "Error: Loom program already running (PID $old_pid)" >&2
+            echo "Use 'loom-run stop' first" >&2
+            exit 1
+        else
+            # Stale PID file
+            rm -f "$LOOM_PID_FILE"
+        fi
+    fi
+    
+    echo "Starting loom program: $program_file"
+    echo "Server port: $port"
+    
+    # Set up environment
+    export LOOM_SERVER_URL="http://localhost:$port"
+    
+    # Start program in background
+    nohup python "$program_file" > "$LOOM_LOG_FILE" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$LOOM_PID_FILE"
+    
+    echo "Program started with PID $pid"
+    echo "Logs: $LOOM_LOG_FILE"
+    echo "Run 'loom-run status' to check progress"
+}
+
+show_status() {
+    echo "=== Loom Status ==="
+    
+    # Check process status
+    if [[ -f "$LOOM_PID_FILE" ]]; then
+        local pid
+        pid=$(cat "$LOOM_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Process: Running (PID $pid)"
+        else
+            echo "Process: Not running (stale PID file)"
+            rm -f "$LOOM_PID_FILE"
+            return
+        fi
+    else
+        echo "Process: Not running"
+        return
+    fi
+    
+    # Show state from loom-state.json
+    echo ""
+    echo "=== State ==="
+    if [[ -f "loom-state.json" ]]; then
+        if command -v jq >/dev/null 2>&1; then
+            cat loom-state.json | jq .
+        else
+            cat loom-state.json
+        fi
+    else
+        echo "No state file found"
+    fi
+    
+    # Show last few log lines
+    echo ""
+    echo "=== Recent Log ==="
+    if [[ -f "$LOOM_LOG_FILE" ]]; then
+        tail -10 "$LOOM_LOG_FILE"
+    else
+        echo "No log file found"
+    fi
+}
+
+tail_log() {
+    if [[ ! -f "$LOOM_LOG_FILE" ]]; then
+        echo "Error: Log file '$LOOM_LOG_FILE' not found" >&2
+        exit 1
+    fi
+    
+    echo "Tailing $LOOM_LOG_FILE (Ctrl+C to exit)..."
+    tail -f "$LOOM_LOG_FILE"
+}
+
+stop_program() {
+    if [[ ! -f "$LOOM_PID_FILE" ]]; then
+        echo "No running loom program found"
+        return
+    fi
+    
+    local pid
+    pid=$(cat "$LOOM_PID_FILE")
+    
+    echo "Stopping loom program (PID $pid)..."
+    
+    if kill -0 "$pid" 2>/dev/null; then
+        # Send SIGTERM first
+        kill "$pid"
+        
+        # Wait up to 10 seconds for graceful shutdown
+        local count=0
+        while kill -0 "$pid" 2>/dev/null && [[ $count -lt 10 ]]; do
+            sleep 1
+            ((count++))
+        done
+        
+        # Force kill if still running
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Force killing..."
+            kill -9 "$pid"
+            sleep 1
+        fi
+        
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "Error: Could not kill process $pid" >&2
+            exit 1
+        else
+            echo "Program stopped"
+        fi
+    else
+        echo "Process $pid not running (cleaning up stale PID file)"
+    fi
+    
+    rm -f "$LOOM_PID_FILE"
+}
+
+# Main command dispatch
+case "${1:-}" in
+    ""|"-h"|"--help"|"help")
+        show_help
+        ;;
+    status)
+        show_status
+        ;;
+    log)
+        tail_log
+        ;;
+    stop)
+        stop_program
+        ;;
+    *.py)
+        start_program "$@"
+        ;;
+    *)
+        echo "Error: Unknown command '$1'" >&2
+        echo "Run 'loom-run --help' for usage" >&2
+        exit 1
+        ;;
+esac
