@@ -43,17 +43,46 @@ def _extract_json(text):
 
 
 class StepRuntime:
+    """Runtime that manages a persistent session with the OpenCode server.
+
+    Each step() call is a new query in the SAME session — context accumulates
+    across steps. The model remembers previous steps, tool results, and state.
+    The Python program controls flow (loops, branching) while the model retains
+    full conversational memory.
+    """
+
     def __init__(self, server_url=None, cwd="."):
         self.server_url = server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")
         self.cwd = cwd
+        self._client = None
+
+    async def _ensure_connected(self):
+        """Connect to the server if not already connected."""
+        if self._client is None:
+            self._client = SDKClient(options=AgentOptions(
+                server_url=self.server_url,
+                cwd=self.cwd,
+            ))
+            await self._client.connect()
 
     async def step(self, instruction, context=None, schema=None):
+        """Execute one step in the persistent session.
+
+        Args:
+            instruction: What to do. Natural language.
+            context: Additional context to include with the instruction.
+                     This is appended to the prompt, NOT a replacement for
+                     the model's accumulated memory.
+            schema: If provided, the step must return structured JSON output.
+
+        Returns:
+            A string (default) or a parsed dict if schema was specified.
+        """
         # Build prompt
         prompt = instruction
         if context is not None:
             prompt = f"Context:\n{context}\n\nTask: {instruction}"
         if schema is not None:
-            # Build a clear description of expected output
             schema_desc = json.dumps(schema, indent=2)
             prompt += (
                 f"\n\nRespond with ONLY a JSON object. The keys and their expected types are:\n"
@@ -64,32 +93,39 @@ class StepRuntime:
                 f"Return ONLY the JSON object, no other text."
             )
 
-        # Each step = fresh session (fresh context window)
-        client = SDKClient(options=AgentOptions(
-            server_url=self.server_url,
-            cwd=self.cwd,
-        ))
-        await client.connect()
-        await client.query(prompt)
+        # Reuse the same session — context accumulates
+        await self._ensure_connected()
+        await self._client.query(prompt)
 
         # Collect response — take only the last assistant message
         # (the first one may echo back the prompt)
         result = ""
-        async for msg in client.receive_response():
+        async for msg in self._client.receive_response():
             if isinstance(msg, AssistantMessage):
                 text = ""
                 for block in msg.content:
                     if isinstance(block, TextBlock):
                         text += block.text
                 if text:
-                    result = text  # overwrite, keeping only the last one
-
-        await client.disconnect()
+                    result = text
 
         # Parse schema if needed
         if schema is not None:
             return _extract_json(result)
         return result
+
+    async def close(self):
+        """Disconnect from the server."""
+        if self._client is not None:
+            await self._client.disconnect()
+            self._client = None
+
+    async def __aenter__(self):
+        await self._ensure_connected()
+        return self
+
+    async def __aexit__(self, *args):
+        await self.close()
 
 
 # Default runtime instance
@@ -106,9 +142,12 @@ def _get_default_runtime():
 async def step(instruction, context=None, schema=None):
     """The single primitive for self-controlling agents.
 
+    Each call is a new turn in the same persistent session. The model
+    remembers all previous steps — context accumulates naturally.
+
     Args:
         instruction: What to do. Natural language.
-        context: What this step can see. Previous results, file contents, state.
+        context: Additional context for this step (appended to prompt).
         schema: If provided, the step must return structured output matching this schema.
 
     Returns:
