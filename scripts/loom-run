@@ -96,7 +96,7 @@ start_program() {
     export LOOM_SERVER_URL="http://localhost:$port"
     
     # Start program in background — loom-run wraps the user's main() with the runtime
-    nohup python -c "
+    nohup python3 -c "
 import asyncio, importlib.util, sys, os
 sys.path.insert(0, os.getcwd())
 spec = importlib.util.spec_from_file_location('program', '$program_file')
