@@ -1,19 +1,31 @@
+"""Loom: the step() primitive.
+
+The model writes a program with def main(step). loom-run executes it,
+injecting step() which sends each instruction into the model's own session.
+
+    def main(step):
+        result = step("run train.py, report loss")
+        step(f"loss was {result}, try to improve it")
+
+step(instruction) -> str
+step(instruction, schema={...}) -> dict
+"""
+
 import json
 import re
 import os
+import asyncio
 from opencode_agent_sdk import SDKClient, AgentOptions, AssistantMessage, TextBlock
 
 
 def _extract_json(text):
     """Extract JSON object from model response, handling markdown fences and surrounding text."""
-    # Try direct parse first
     text = text.strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # Strip markdown code fences
     fenced = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if fenced:
         try:
@@ -21,12 +33,10 @@ def _extract_json(text):
         except json.JSONDecodeError:
             pass
 
-    # Find first { ... } or [ ... ] in the text
     for start_char, end_char in [('{', '}'), ('[', ']')]:
         start = text.find(start_char)
         if start == -1:
             continue
-        # Find matching closing bracket
         depth = 0
         for i in range(start, len(text)):
             if text[i] == start_char:
@@ -42,115 +52,74 @@ def _extract_json(text):
     raise ValueError(f"Could not extract valid JSON from response: {text[:200]}")
 
 
-class StepRuntime:
-    """Runtime that manages a persistent session with the OpenCode server.
+async def _send_step(client, instruction, schema=None):
+    """Send one step to the session and return the result."""
+    prompt = instruction
+    if schema is not None:
+        schema_desc = json.dumps(schema, indent=2)
+        prompt += (
+            f"\n\nRespond with ONLY a JSON object. The keys and their expected types are:\n"
+            f"{schema_desc}\n\n"
+            f"Replace the type descriptions with actual values. "
+            f"For example, if the schema is {{\"name\": \"str\", \"age\": \"int\"}}, "
+            f"you would return {{\"name\": \"Alice\", \"age\": 30}}.\n"
+            f"Return ONLY the JSON object, no other text."
+        )
 
-    Each step() call is a new query in the SAME session — context accumulates
-    across steps. The model remembers previous steps, tool results, and state.
-    The Python program controls flow (loops, branching) while the model retains
-    full conversational memory.
-    """
+    await client.query(prompt)
 
-    def __init__(self, server_url=None, cwd="."):
-        self.server_url = server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")
-        self.cwd = cwd
-        self._client = None
+    result = ""
+    async for msg in client.receive_response():
+        if isinstance(msg, AssistantMessage):
+            text = ""
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    text += block.text
+            if text:
+                result = text
 
-    async def _ensure_connected(self):
-        """Connect to the server if not already connected."""
-        if self._client is None:
-            self._client = SDKClient(options=AgentOptions(
-                server_url=self.server_url,
-                cwd=self.cwd,
-            ))
-            await self._client.connect()
-
-    async def step(self, instruction, context=None, schema=None):
-        """Execute one step in the persistent session.
-
-        Args:
-            instruction: What to do. Natural language.
-            context: Additional context to include with the instruction.
-                     This is appended to the prompt, NOT a replacement for
-                     the model's accumulated memory.
-            schema: If provided, the step must return structured JSON output.
-
-        Returns:
-            A string (default) or a parsed dict if schema was specified.
-        """
-        # Build prompt
-        prompt = instruction
-        if context is not None:
-            prompt = f"Context:\n{context}\n\nTask: {instruction}"
-        if schema is not None:
-            schema_desc = json.dumps(schema, indent=2)
-            prompt += (
-                f"\n\nRespond with ONLY a JSON object. The keys and their expected types are:\n"
-                f"{schema_desc}\n\n"
-                f"Replace the type descriptions with actual values. "
-                f"For example, if the schema is {{\"name\": \"str\", \"age\": \"int\"}}, "
-                f"you would return {{\"name\": \"Alice\", \"age\": 30}}.\n"
-                f"Return ONLY the JSON object, no other text."
-            )
-
-        # Reuse the same session — context accumulates
-        await self._ensure_connected()
-        await self._client.query(prompt)
-
-        # Collect response — take only the last assistant message
-        # (the first one may echo back the prompt)
-        result = ""
-        async for msg in self._client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                text = ""
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        text += block.text
-                if text:
-                    result = text
-
-        # Parse schema if needed
-        if schema is not None:
-            return _extract_json(result)
-        return result
-
-    async def close(self):
-        """Disconnect from the server."""
-        if self._client is not None:
-            await self._client.disconnect()
-            self._client = None
-
-    async def __aenter__(self):
-        await self._ensure_connected()
-        return self
-
-    async def __aexit__(self, *args):
-        await self.close()
+    if schema is not None:
+        return _extract_json(result)
+    return result
 
 
-# Default runtime instance
-_default_runtime = None
+async def run_program(program_fn, server_url=None, cwd=None):
+    """Execute a loom program.
 
-
-def _get_default_runtime():
-    global _default_runtime
-    if _default_runtime is None:
-        _default_runtime = StepRuntime()
-    return _default_runtime
-
-
-async def step(instruction, context=None, schema=None):
-    """The single primitive for self-controlling agents.
-
-    Each call is a new turn in the same persistent session. The model
-    remembers all previous steps — context accumulates naturally.
+    The program_fn receives a step() function that sends instructions
+    into a persistent session. Context accumulates across steps.
 
     Args:
-        instruction: What to do. Natural language.
-        context: Additional context for this step (appended to prompt).
-        schema: If provided, the step must return structured output matching this schema.
-
-    Returns:
-        A string (default) or a structured object if schema was specified.
+        program_fn: A function that takes step as its argument.
+                    Can be sync (def main(step)) or async (async def main(step)).
+        server_url: OpenCode server URL. Defaults to LOOM_SERVER_URL env or localhost:54321.
+        cwd: Working directory. Defaults to current directory.
     """
-    return await _get_default_runtime().step(instruction, context, schema)
+    server_url = server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")
+    cwd = cwd or os.getcwd()
+
+    client = SDKClient(options=AgentOptions(
+        server_url=server_url,
+        cwd=cwd,
+    ))
+    await client.connect()
+
+    try:
+        async def step(instruction, schema=None):
+            """Send an instruction to the model and get the result.
+
+            Args:
+                instruction: What to do. Natural language.
+                schema: If provided, returns structured JSON output.
+
+            Returns:
+                str (default) or dict (if schema provided).
+            """
+            return await _send_step(client, instruction, schema)
+
+        result = program_fn(step)
+        # Support both sync and async main functions
+        if asyncio.iscoroutine(result):
+            await result
+    finally:
+        await client.disconnect()

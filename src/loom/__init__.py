@@ -1,4 +1,2 @@
-from loom.step import step, StepRuntime
+from loom.step import run_program
 from loom import state
-
-__all__ = ["step", "StepRuntime", "state"]

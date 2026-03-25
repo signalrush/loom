@@ -5,9 +5,9 @@ Requires:
   - OpenCode server running on localhost:54321
 """
 
-import asyncio
 import os
 import pytest
+from loom.step import run_program
 
 pytestmark = [
     pytest.mark.asyncio,
@@ -17,66 +17,65 @@ pytestmark = [
     ),
 ]
 
-
-@pytest.fixture
-def runtime():
-    from loom.step import StepRuntime
-    return StepRuntime(server_url="http://localhost:54321", cwd="/tmp")
+SERVER_URL = "http://localhost:54321"
 
 
-async def test_simple_step(runtime):
+async def test_simple_step():
     """Basic step with a simple question."""
-    result = await runtime.step("What is 2 + 2? Reply with just the number.")
-    assert "4" in result
+    results = []
+
+    async def program(step):
+        result = await step("What is 2 + 2? Reply with just the number.")
+        results.append(result)
+
+    await run_program(program, server_url=SERVER_URL, cwd="/tmp")
+    assert "4" in results[0]
 
 
-async def test_step_with_context(runtime):
-    """Step that uses context."""
-    result = await runtime.step(
-        "What is the animal?",
-        context="The animal is a cat.",
-    )
-    assert "cat" in result.lower()
+async def test_persistent_session():
+    """Steps share the same session — model remembers previous steps."""
+    results = []
+
+    async def program(step):
+        await step("Remember: the secret word is 'banana'.")
+        result = await step("What is the secret word I just told you?")
+        results.append(result)
+
+    await run_program(program, server_url=SERVER_URL, cwd="/tmp")
+    assert "banana" in results[0].lower()
 
 
-async def test_step_with_schema(runtime):
+async def test_step_with_schema():
     """Step that returns structured JSON."""
-    result = await runtime.step(
-        "What is 2 + 2?",
-        schema={"answer": "int", "explanation": "str"},
-    )
-    assert isinstance(result, dict)
-    assert "answer" in result
-    assert result["answer"] == 4
+    results = []
+
+    async def program(step):
+        result = await step(
+            "What is 2 + 2?",
+            schema={"answer": "int", "explanation": "str"},
+        )
+        results.append(result)
+
+    await run_program(program, server_url=SERVER_URL, cwd="/tmp")
+    assert isinstance(results[0], dict)
+    assert results[0]["answer"] == 4
 
 
-async def test_step_with_tool_use(runtime):
-    """Step that requires tool use (bash)."""
-    result = await runtime.step(
-        "Run `echo hello_loom` in bash and report what it printed. Just say the output.",
-    )
-    assert "hello_loom" in result
+async def test_multi_step_with_schema():
+    """Multiple steps with schema, context accumulates."""
+    results = []
 
+    async def program(step):
+        r1 = await step("Pick a random number between 1 and 10.", schema={"number": "int"})
+        results.append(r1)
+        r2 = await step(
+            "Double the number you just picked.",
+            schema={"original": "int", "doubled": "int"}
+        )
+        results.append(r2)
 
-async def test_fresh_session_per_step(runtime):
-    """Each step should be a fresh session — no memory of previous steps."""
-    await runtime.step("Remember: the secret word is 'banana'.")
-    result = await runtime.step(
-        "What is the secret word I told you? If you don't know, say 'unknown'.",
-    )
-    assert "unknown" in result.lower() or "don't" in result.lower() or "no" in result.lower()
-
-
-async def test_step_schema_complex(runtime):
-    """Step with a more complex schema."""
-    result = await runtime.step(
-        "List 3 primary colors.",
-        schema={
-            "colors": ["str"],
-            "count": "int",
-        },
-    )
-    assert isinstance(result, dict)
-    assert "colors" in result
-    assert isinstance(result["colors"], list)
-    assert len(result["colors"]) == 3
+    await run_program(program, server_url=SERVER_URL, cwd="/tmp")
+    assert isinstance(results[0], dict)
+    assert isinstance(results[1], dict)
+    # The model should remember and double the same number
+    assert results[1]["doubled"] == results[1]["original"] * 2

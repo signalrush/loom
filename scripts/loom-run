@@ -95,8 +95,16 @@ start_program() {
     # Set up environment
     export LOOM_SERVER_URL="http://localhost:$port"
     
-    # Start program in background
-    nohup python "$program_file" > "$LOOM_LOG_FILE" 2>&1 &
+    # Start program in background — loom-run wraps the user's main() with the runtime
+    nohup python -c "
+import asyncio, importlib.util, sys, os
+sys.path.insert(0, os.getcwd())
+spec = importlib.util.spec_from_file_location('program', '$program_file')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+from loom.step import run_program
+asyncio.run(run_program(mod.main))
+" > "$LOOM_LOG_FILE" 2>&1 &
     local pid=$!
     echo "$pid" > "$LOOM_PID_FILE"
     

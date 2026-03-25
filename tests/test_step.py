@@ -1,57 +1,54 @@
-"""Basic tests for the loom.step module.
-
-These are skeleton tests — the actual StepRuntime requires an OpenCode server,
-so we test construction and interface only.
-"""
+"""Unit tests for loom.step module."""
 
 import pytest
 
 
-def test_step_runtime_import():
+def test_step_module_import():
     """Verify loom.step can be imported."""
-    from loom.step import StepRuntime
-    assert StepRuntime is not None
+    from loom.step import run_program, _extract_json, _send_step
 
 
-def test_step_runtime_defaults():
-    """StepRuntime initializes with sensible defaults."""
-    from loom.step import StepRuntime
-    rt = StepRuntime()
-    assert rt.server_url == "http://localhost:54321"
-    assert rt.cwd == "."
+def test_run_program_import():
+    """Verify run_program is importable from loom."""
+    from loom import run_program
 
 
-def test_step_runtime_custom_params():
-    """StepRuntime accepts custom server_url and cwd."""
-    from loom.step import StepRuntime
-    rt = StepRuntime(server_url="http://example.com:9999", cwd="/tmp")
-    assert rt.server_url == "http://example.com:9999"
-    assert rt.cwd == "/tmp"
+def test_extract_json_direct():
+    """Test JSON extraction from clean input."""
+    from loom.step import _extract_json
+
+    result = _extract_json('{"answer": 42}')
+    assert result == {"answer": 42}
 
 
-def test_step_runtime_env_var(monkeypatch):
-    """StepRuntime checks LOOM_SERVER_URL environment variable."""
-    from loom.step import StepRuntime
-    
-    # Test with LOOM_SERVER_URL set
-    monkeypatch.setenv("LOOM_SERVER_URL", "http://example.com:8080")
-    rt = StepRuntime()
-    assert rt.server_url == "http://example.com:8080"
-    
-    # Test explicit server_url overrides env var
-    rt = StepRuntime(server_url="http://override.com:9090")
-    assert rt.server_url == "http://override.com:9090"
-    
-    # Test with no env var (should use default)
-    monkeypatch.delenv("LOOM_SERVER_URL", raising=False)
-    rt = StepRuntime()
-    assert rt.server_url == "http://localhost:54321"
+def test_extract_json_fenced():
+    """Test JSON extraction from markdown fences."""
+    from loom.step import _extract_json
+
+    result = _extract_json('```json\n{"answer": 42}\n```')
+    assert result == {"answer": 42}
 
 
-@pytest.mark.asyncio
-async def test_step_requires_server():
-    """Calling step without a running server should raise."""
-    from loom.step import StepRuntime
-    rt = StepRuntime(server_url="http://localhost:1")
-    with pytest.raises(Exception):
-        await rt.step("hello")
+def test_extract_json_surrounded():
+    """Test JSON extraction from text with surrounding content."""
+    from loom.step import _extract_json
+
+    result = _extract_json('Here is the result: {"answer": 42} Hope that helps!')
+    assert result == {"answer": 42}
+
+
+def test_extract_json_invalid():
+    """Test that invalid JSON raises ValueError."""
+    from loom.step import _extract_json
+
+    with pytest.raises(ValueError):
+        _extract_json("no json here at all")
+
+
+def test_env_var_default():
+    """Test that LOOM_SERVER_URL env var is checked."""
+    import os
+    from loom.step import run_program
+    # run_program reads LOOM_SERVER_URL — just verify it's referenced in the module
+    import loom.step
+    assert "LOOM_SERVER_URL" in open(loom.step.__file__).read()

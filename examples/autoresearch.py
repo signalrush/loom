@@ -1,47 +1,37 @@
 """Autoresearch: autonomous experiment loop using loom.
 
-Requires a running OpenCode server (`opencode serve`) and a train.py
-in the working directory.
+The model writes this program. loom-run executes it.
+Each step() is a turn in the model's own session — context accumulates.
+
+Usage:
+    loom-run autoresearch.py
 """
 
-import asyncio
-from loom import StepRuntime
 
-
-async def main():
-    rt = StepRuntime(server_url="http://localhost:54321", cwd=".")
-
-    # Baseline
-    baseline = await rt.step(
-        "Run `uv run train.py > run.log 2>&1`, then `grep '^val_bpb:' run.log`. Report the val_bpb.",
+async def main(step):
+    # Get baseline
+    baseline = await step(
+        "Run `python train.py > run.log 2>&1`, then `grep '^val_bpb:' run.log`. Report the val_bpb.",
         schema={"val_bpb": "float"},
     )
     best = baseline["val_bpb"]
 
-    count = 0
-    while True:
-        count += 1
-        result = await rt.step(
-            "Propose one experiment. Edit train.py, git commit, run it, report results.",
-            context={"best_so_far": best, "experiment_number": count},
+    for i in range(20):
+        result = await step(
+            f"Experiment {i+1}: propose one change to improve val_bpb. "
+            f"Current best is {best}. Edit train.py, git commit, run it, report results.",
             schema={"val_bpb": "float", "description": "str", "status": "str"},
         )
 
         if result["val_bpb"] < best:
             best = result["val_bpb"]
-            await rt.step(
-                f"Log keep to results.tsv: {result['description']}, val_bpb={result['val_bpb']}"
-            )
+            await step(f"Good, val_bpb improved to {best}. Keep this change.")
         else:
-            await rt.step(
-                f"Log discard to results.tsv: {result['description']}. Git reset to previous commit."
+            await step("This didn't improve. Revert: git reset --hard HEAD~1")
+
+        if (i + 1) % 5 == 0:
+            await step(
+                f"Pause and reflect. Best val_bpb so far: {best}. "
+                "Read results history. What patterns are working? "
+                "What should we try next?"
             )
-
-        if count % 10 == 0:
-            await rt.step(
-                "Read results.tsv. Reflect on what directions are working. Adjust strategy for next experiments."
-            )
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
