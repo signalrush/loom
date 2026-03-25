@@ -1,263 +1,145 @@
-# Loom Skill - Self-Controlling Agent Programs
+# Loom Skill — Self-Controlling Agent Programs
 
 ## What is Loom?
 
-Loom lets you write Python programs that control their own execution flow using the `step()` primitive. Instead of being limited to a single conversation, you can write programs that loop, branch, plan, and replan while maintaining state across hundreds or thousands of iterations.
+Loom lets you write a Python program that controls your own execution. You write `async def main(step)` — the `step` function sends instructions back into your session. Context accumulates. You remember everything.
 
-Each `step()` call is a full agent turn with tool access, but the Python code around it controls when to continue, what to remember, and how to adapt.
+The Python program is your control flow. `step()` is you acting.
 
 ## How to Use
 
-### 1. Write a Loom Program
-
-Create a Python file using `from loom import step, state`:
+### 1. Write a program
 
 ```python
-# example_program.py
-import asyncio
-from loom import step, state
+# program.py
 
-async def main():
-    # Set initial status
-    state.set("status", "starting")
-    
-    # Get baseline
+async def main(step):
+    # Each step() is a turn in your own session — you remember everything
     baseline = await step(
-        "Run the current train.py and report the validation loss",
+        "Run train.py and report val_loss",
         schema={"val_loss": "float"}
     )
-    
-    # Track progress
-    state.update({
-        "best_loss": baseline["val_loss"],
-        "experiments": 0,
-        "status": "running"
-    })
-    
-    # Main research loop
-    while state.get("experiments") < 100:
-        # Propose and run experiment
-        result = await step(
-            "Propose one experiment to improve the model. "
-            "Edit train.py, test it, and report results.",
-            context=state.get(),
-            schema={"val_loss": "float", "description": "str", "kept": "bool"}
-        )
-        
-        # Update state based on results
-        experiments = state.get("experiments") + 1
-        if result["val_loss"] < state.get("best_loss"):
-            state.update({
-                "best_loss": result["val_loss"],
-                "experiments": experiments
-            })
-        else:
-            state.set("experiments", experiments)
-        
-        # Replan every 10 experiments
-        if experiments % 10 == 0:
-            await step(
-                "Review the results so far and adjust the research strategy",
-                context=state.get()
-            )
-    
-    state.set("status", "complete")
+    best = baseline["val_loss"]
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    for i in range(20):
+        result = await step(
+            f"Experiment {i+1}: try to beat val_loss={best}. "
+            "Edit train.py, commit, run, report.",
+            schema={"val_loss": "float", "description": "str"}
+        )
+
+        if result["val_loss"] < best:
+            best = result["val_loss"]
+            await step(f"Good, improved to {best}. Keep it.")
+        else:
+            await step("Didn't improve. Revert: git reset --hard HEAD~1")
+
+        if (i + 1) % 5 == 0:
+            await step("Reflect: what's working? What to try next?")
 ```
 
-### 2. Run Your Program
+That's it. No imports needed beyond the `step` function passed to `main`.
+
+### 2. Run it
 
 ```bash
-# Start the program in background
-loom-run example_program.py
+loom-run program.py
+```
 
-# Check progress anytime
-loom-run status
+### 3. Monitor
 
-# Watch live logs  
-loom-run log
+```bash
+loom-run status    # process status + state + recent logs
+loom-run log       # tail live output
+loom-run stop      # kill it
+```
 
-# Stop if needed
+### 4. Steer
+
+Kill, edit, restart:
+```bash
 loom-run stop
+# edit program.py
+loom-run program.py
 ```
 
-### 3. Monitor and Steer
-
-Your program writes structured state to `loom-state.json`:
-
-```json
-{
-  "status": "running",
-  "best_loss": 0.234,
-  "experiments": 27
-}
-```
-
-To steer a running program:
-
-1. **Edit and restart**: `loom-run stop`, edit the `.py` file, `loom-run example_program.py`
-2. **Check state anytime**: `cat loom-state.json` or `loom-run status`  
-3. **Watch progress**: `loom-run log` shows live output
-
-## Key Patterns
-
-### Simple Loop with State Tracking
+## step() API
 
 ```python
-from loom import step, state
-import asyncio
-
-async def main():
-    state.set("iteration", 0)
-    
-    while state.get("iteration") < 50:
-        result = await step(
-            f"Run experiment #{state.get('iteration')}",
-            schema={"success": "bool", "result": "str"}
-        )
-        
-        if result["success"]:
-            state.set("last_success", result["result"])
-        
-        state.set("iteration", state.get("iteration") + 1)
-
-asyncio.run(main())
+result = await step(instruction)              # returns str
+result = await step(instruction, schema={})   # returns dict
 ```
 
-### Research with Error Handling  
+- **instruction** (`str`): What to do. Natural language.
+- **schema** (`dict`, optional): Forces structured JSON output. Keys are field names, values are type descriptions.
+
+Each `step()` is a turn in your own session. You have full tool access (bash, file edit, etc). You remember all previous steps.
+
+## State tracking (optional)
+
+For long-running programs, use `loom.state` to write progress to `loom-state.json`:
 
 ```python
-from loom import step, state
-import asyncio
+from loom import state
 
-async def main():
-    state.set("errors", 0)
+async def main(step):
+    state.set("status", "running")
     
-    while state.get("errors") < 3:
+    for i in range(100):
+        result = await step(f"experiment {i}", schema={"score": "float"})
+        state.update({"step": i, "score": result["score"]})
+    
+    state.set("status", "done")
+```
+
+Then `loom-run status` or `cat loom-state.json` shows progress.
+
+## Patterns
+
+### Simple loop
+```python
+async def main(step):
+    for i in range(50):
+        await step(f"Do task {i}")
+```
+
+### Loop with branching
+```python
+async def main(step):
+    best = 999
+    for i in range(20):
+        r = await step(f"Try to beat {best}", schema={"loss": "float"})
+        if r["loss"] < best:
+            best = r["loss"]
+        else:
+            await step("Revert")
+```
+
+### Error handling
+```python
+async def main(step):
+    for i in range(20):
         try:
-            result = await step(
-                "Propose and test a new approach",
-                context=state.get(),
-                schema={"val_metric": "float", "approach": "str"}
-            )
-            
-            # Success - reset error count
-            state.update({
-                "last_result": result,
-                "errors": 0
-            })
-            
+            r = await step(f"Experiment {i}", schema={"loss": "float"})
         except Exception as e:
-            # Handle failures gracefully
-            error_count = state.get("errors") + 1
-            state.set("errors", error_count)
-            
-            await step(f"Experiment failed: {e}. Propose a simpler approach.")
-
-asyncio.run(main())
+            await step(f"Failed: {e}. Try a simpler approach.")
 ```
 
-### Auto-Research with Replanning
-
+### Replanning
 ```python
-from loom import step, state
-import asyncio
-
-async def main():
-    # Initialize
-    baseline = await step("Get baseline metrics", schema={"score": "float"})
-    state.update({
-        "best_score": baseline["score"],
-        "total_experiments": 0,
-        "strategy": "initial"
-    })
-    
-    # Research loop with adaptive strategy
-    while state.get("total_experiments") < 200:
-        # Run experiments in batches
-        for i in range(10):
-            result = await step(
-                f"Run experiment using {state.get('strategy')} strategy",
-                context=state.get(),
-                schema={"score": "float", "description": "str"}
-            )
-            
-            if result["score"] > state.get("best_score"):
-                state.update({
-                    "best_score": result["score"],
-                    "best_description": result["description"]
-                })
-            
-            state.set("total_experiments", state.get("total_experiments") + 1)
-        
-        # Replan strategy every 10 experiments
-        new_strategy = await step(
-            "Review the last 10 experiments and propose a new strategy",
-            context=state.get(),
-            schema={"strategy": "str", "reasoning": "str"}
-        )
-        
-        state.set("strategy", new_strategy["strategy"])
-
-asyncio.run(main())
+async def main(step):
+    for i in range(100):
+        await step(f"Experiment {i}")
+        if (i + 1) % 10 == 0:
+            await step("Reflect on last 10 experiments. Adjust strategy.")
 ```
 
-## API Reference
+## When to use Loom
 
-### `step(instruction, context=None, schema=None)`
+**Use it for:** long-running loops, research, optimization, anything needing 10+ steps with branching logic
 
-The core primitive for agent actions.
+**Don't use it for:** one-shot tasks, simple questions — just do those in normal conversation
 
-- **instruction** (`str`): What to do in natural language
-- **context** (`any`, optional): Information for this step to see  
-- **schema** (`dict`, optional): If provided, forces structured JSON output
+## Key insight
 
-Returns a string (default) or structured object (if schema provided).
-
-### `state` module
-
-Manages persistent state in `loom-state.json`:
-
-- **`state.set(key, value)`**: Set a single key
-- **`state.update(dict)`**: Merge a dictionary into state  
-- **`state.get(key=None)`**: Get one key or entire state dict
-
-State is thread-safe and persists across program restarts.
-
-### `loom-run` commands
-
-- **`loom-run program.py [--port PORT]`**: Start program in background
-- **`loom-run status`**: Show process status + state + recent logs
-- **`loom-run log`**: Tail the live log output
-- **`loom-run stop`**: Kill the running program
-
-## When to Use Loom
-
-**Perfect for:**
-- Long-running research and optimization
-- Multi-step workflows with branching logic
-- Programs that need to adapt strategy over time
-- Tasks requiring hundreds of iterations
-- Experiments that run for hours or days
-
-**Not ideal for:**
-- Simple one-shot tasks (just use regular conversation)  
-- Real-time interactions requiring immediate response
-- Tasks that don't benefit from persistent state
-
-## Tips
-
-1. **Use structured state**: Keep important data in `state.update({...})` so it survives restarts
-2. **Schema where Python needs it**: Use `schema=` when your code needs to branch on the results  
-3. **Replan periodically**: Add replanning steps every N iterations to adapt strategy
-4. **Handle errors**: Wrap `step()` calls in try/except for robust programs
-5. **Start simple**: Begin with a basic loop, then add complexity as needed
-
-## Getting Help
-
-- Read `references/program-guide.md` for detailed programming patterns
-- Check `examples/` directory for complete example programs
-- Use `loom-run status` to debug running programs
-- Edit and restart programs freely - state persists in JSON files
+`step()` is NOT a sub-agent. It's you, continuing to work. The Python program just controls when and how you work. You keep your full memory across all steps.
