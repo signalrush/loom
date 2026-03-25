@@ -261,51 +261,52 @@ def test_hook_script_dead_pid_cleanup(tmp_path):
     assert not (claude_dir / "auto-loop.json").exists(), "State file should be deleted for dead PID"
 
 
-def test_hook_transcript_grep_matches_spaced_role(tmp_path):
-    """B4: the grep pattern must match 'role': 'assistant' with spaces around the colon.
+def test_hook_transcript_tail_jq_returns_last_assistant_text(tmp_path):
+    """Transcript extraction uses tail -n 200 | jq -rs with role filtering in jq.
 
-    Tests the grep pattern used in stop-hook.sh Phase 1 directly, without running
+    Tests the actual pipeline in stop-hook.sh Phase 1 directly, without running
     the full hook loop (which would block in Phase 2).
     """
-    # Write a transcript JSONL with spaces around the colon in "role": "assistant"
     transcript_path = tmp_path / "transcript.jsonl"
     transcript_lines = [
         '{"type": "message", "role": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}',
-        '{"type": "message", "role": "assistant", "message": {"content": [{"type": "text", "text": "hello from spaced transcript"}]}}',
+        '{"type": "message", "role": "assistant", "message": {"content": [{"type": "text", "text": "hello from assistant"}]}}',
     ]
     transcript_path.write_text("\n".join(transcript_lines) + "\n")
 
-    # Run the grep pattern from stop-hook.sh and pipe to jq, exactly as the hook does
-    grep_and_jq = subprocess.run(
+    # Run the exact pipeline used in stop-hook.sh lines 59-61
+    result = subprocess.run(
         [
             "bash", "-c",
-            f"grep '\"role\"[[:space:]]*:[[:space:]]*\"assistant\"' {transcript_path} | tail -n 100"
-            f" | jq -rs 'map(.message.content[]? | select(.type == \"text\") | .text) | last // \"\"'"
+            f"tail -n 200 {transcript_path}"
+            f" | jq -rs '[.[] | select(.role == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text] | last // \"\"'"
         ],
         capture_output=True, text=True,
     )
-    assert grep_and_jq.returncode == 0, f"grep/jq failed: {grep_and_jq.stderr}"
-    output = grep_and_jq.stdout.strip()
-    assert output == "hello from spaced transcript", f"Got: {output!r}"
+    assert result.returncode == 0, f"tail/jq failed: {result.stderr}"
+    output = result.stdout.strip()
+    assert output == "hello from assistant", f"Got: {output!r}"
 
 
-def test_hook_transcript_grep_matches_compact_role(tmp_path):
-    """B4: the grep pattern must also match compact 'role':'assistant' (no spaces)."""
+def test_hook_transcript_tail_jq_returns_last_of_multiple_assistant_turns(tmp_path):
+    """When multiple assistant turns exist, jq | last returns the final one."""
     transcript_path = tmp_path / "transcript.jsonl"
     transcript_lines = [
-        '{"type":"message","role":"user","message":{"content":[{"type":"text","text":"hi"}]}}',
-        '{"type":"message","role":"assistant","message":{"content":[{"type":"text","text":"hello compact"}]}}',
+        '{"type": "message", "role": "user", "message": {"content": [{"type": "text", "text": "q1"}]}}',
+        '{"type": "message", "role": "assistant", "message": {"content": [{"type": "text", "text": "answer one"}]}}',
+        '{"type": "message", "role": "user", "message": {"content": [{"type": "text", "text": "q2"}]}}',
+        '{"type": "message", "role": "assistant", "message": {"content": [{"type": "text", "text": "answer two"}]}}',
     ]
     transcript_path.write_text("\n".join(transcript_lines) + "\n")
 
-    grep_and_jq = subprocess.run(
+    result = subprocess.run(
         [
             "bash", "-c",
-            f"grep '\"role\"[[:space:]]*:[[:space:]]*\"assistant\"' {transcript_path} | tail -n 100"
-            f" | jq -rs 'map(.message.content[]? | select(.type == \"text\") | .text) | last // \"\"'"
+            f"tail -n 200 {transcript_path}"
+            f" | jq -rs '[.[] | select(.role == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text] | last // \"\"'"
         ],
         capture_output=True, text=True,
     )
-    assert grep_and_jq.returncode == 0, f"grep/jq failed: {grep_and_jq.stderr}"
-    output = grep_and_jq.stdout.strip()
-    assert output == "hello compact", f"Got: {output!r}"
+    assert result.returncode == 0, f"tail/jq failed: {result.stderr}"
+    output = result.stdout.strip()
+    assert output == "answer two", f"Got: {output!r}"
