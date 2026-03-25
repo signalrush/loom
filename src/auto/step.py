@@ -1,8 +1,15 @@
-"""Auto: the step() primitive.
+"""Auto: the step() primitive via Claude Code stop hook IPC.
 
-The model writes a program with def main(step). auto-run executes it,
-injecting step() which sends each instruction into an agent session
-via the opencode serve HTTP API.
+The Python program runs as a sidecar process alongside a Claude Code TUI session.
+Communication happens through .claude/auto-loop.json. A stop hook installed in
+the project's .claude/hooks.json intercepts Claude's turn endings and relays
+instructions/responses.
+
+IMPORTANT: auto-run MUST be invoked from the project root (the directory
+containing .claude/). The state file path .claude/auto-loop.json is resolved
+relative to the git repo root detected at startup. If run from a different
+directory, the hook (which runs in the project root) will not find the state
+file and the loop will never start.
 
     async def main(step):
         result = await step("run train.py, report loss")
@@ -10,16 +17,52 @@ via the opencode serve HTTP API.
 
 step(instruction) -> str
 step(instruction, schema={...}) -> dict
+step(instruction, schema={...}, schema_strict=False) -> dict (nulls on parse failure)
 """
 
+import asyncio
 import json
-import re
 import os
-import httpx
+import re
+import signal
+import subprocess
+import tempfile
+import time
+from pathlib import Path
 
+
+# --- Constants ---
+
+POLL_INTERVAL = 0.1  # 100ms
+
+
+# --- CWD / state file resolution ---
+
+def _find_repo_root() -> Path:
+    """Find the git repo root starting from cwd. Falls back to cwd if not a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=True
+        )
+        return Path(result.stdout.strip())
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("[auto] WARNING: git not available, falling back to cwd for state file path", flush=True)
+        return Path.cwd()
+
+
+def _state_file_path() -> Path:
+    """Resolve the state file path relative to the git repo root."""
+    return _find_repo_root() / ".claude" / "auto-loop.json"
+
+
+# --- JSON extraction (preserved from current step.py) ---
 
 def _extract_json(text):
-    """Extract JSON object from model response, handling markdown fences and surrounding text."""
+    """Extract JSON object from model response, handling markdown fences and surrounding text.
+
+    Raises ValueError if no valid JSON can be extracted.
+    """
     text = text.strip()
     try:
         return json.loads(text)
@@ -52,126 +95,210 @@ def _extract_json(text):
     raise ValueError(f"Could not extract valid JSON from response: {text[:200]}")
 
 
-async def _send_message(client, server_url, session_id, text):
-    """Send a message and return the last text part from the response."""
-    resp = await client.post(
-        f"{server_url}/session/{session_id}/message",
-        json={"parts": [{"type": "text", "text": text}]},
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    result = ""
-    for part in data.get("parts", []):
-        if part.get("type") == "text":
-            result = part["text"]
-    return result
+# --- State file I/O ---
 
+def _write_state(data: dict) -> None:
+    """Write state file atomically."""
+    state_path = _state_file_path()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
 
-async def _send_step(client, server_url, session_id, instruction, schema=None):
-    """Send one step to the session via REST API and return the result."""
-    prompt = instruction
-    if schema is not None:
-        schema_desc = json.dumps(schema, indent=2)
-        prompt += (
-            f"\n\nRespond with ONLY a JSON object. The keys and their expected types are:\n"
-            f"{schema_desc}\n\n"
-            f"Replace the type descriptions with actual values. "
-            f"For example, if the schema is {{\"name\": \"str\", \"age\": \"int\"}}, "
-            f"you would return {{\"name\": \"Alice\", \"age\": 30}}.\n"
-            f"Return ONLY the JSON object, no other text."
-        )
-
-    result = await _send_message(client, server_url, session_id, prompt)
-
-    if schema is None:
-        return result
-
-    # Try to parse JSON, if it fails ask the model to fix it
-    for attempt in range(3):
+    # Clean orphaned temp files from prior crashes
+    for f in state_path.parent.glob(".auto-loop-*.tmp"):
         try:
-            return _extract_json(result)
-        except ValueError:
-            if attempt == 2:
-                print(f"[auto] JSON parse failed after 3 attempts, returning raw text")
-                return {k: None for k in schema}
-            print(f"[auto] JSON parse failed, asking model to reformat...")
-            result = await _send_message(
-                client, server_url, session_id,
-                f"Your previous response was not valid JSON. Return ONLY a JSON object with these keys: {json.dumps(schema)}. No other text."
-            )
+            f.unlink()
+        except OSError:
+            pass
+
+    data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    fd, temp_path = tempfile.mkstemp(
+        dir=state_path.parent,
+        prefix=".auto-loop-",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.rename(temp_path, state_path)
+    except Exception:
+        os.unlink(temp_path)
+        raise
 
 
-async def _get_or_create_session(client, server_url, session_id=None):
-    """Get an existing session or create a new one.
+def _read_state() -> dict | None:
+    """Read state file. Returns None if file doesn't exist."""
+    try:
+        with open(_state_file_path()) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
 
-    If session_id is provided, uses that directly.
-    Otherwise lists sessions and uses the most recent one,
-    or creates a new session if none exist.
+
+# --- Core loop ---
+
+async def _wait_for_response(step_number: int) -> str:
+    """Poll state file until status becomes 'responded' or 'error'.
+
+    Returns the response text.
+    Raises RuntimeError on error or if state file disappears.
+    Polls indefinitely -- the only exit conditions are:
+      - status becomes 'responded' with matching step_number
+      - status becomes 'error'
+      - state file disappears
     """
-    if session_id:
-        return session_id
+    while True:
+        state = _read_state()
 
-    # List existing sessions and use the most recent
-    resp = await client.get(f"{server_url}/session")
-    resp.raise_for_status()
-    sessions = resp.json()
+        if state is None:
+            raise RuntimeError("State file disappeared -- hook or session ended")
 
-    if sessions:
-        # Sort by updated time, use most recent
-        sessions.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
-        return sessions[0]["id"]
+        if state.get("status") == "responded" and state.get("step_number") == step_number:
+            return state.get("response", "")
 
-    # No sessions exist, create one
-    resp = await client.post(f"{server_url}/session")
-    resp.raise_for_status()
-    return resp.json()["id"]
+        if state.get("status") == "error":
+            error_step = state.get("step_number", 0)
+            if error_step >= step_number:
+                raise RuntimeError(f"Hook error: {state.get('error', 'unknown')}")
+
+        await asyncio.sleep(POLL_INTERVAL)
 
 
-async def run_program(program_fn, server_url=None, cwd=None, session_id=None):
-    """Execute an auto program.
+async def run_program(program_fn):
+    """Execute an auto program using stop-hook IPC.
 
-    Sends steps to an opencode serve instance via HTTP. All steps run in
-    the SAME session — the agent remembers everything.
+    Writes instructions to .claude/auto-loop.json and polls for responses.
+    A stop hook installed in the Claude Code session reads these instructions
+    and injects them as Claude's next turn.
 
-    By default, attaches to the most recent existing session (the one
-    visible in the TUI). Set AUTO_SESSION_ID to target a specific session.
-
-    Requires `opencode serve` to be running.
+    MUST be run from the project root (directory containing .claude/).
 
     Args:
         program_fn: An async function that takes step as its argument.
-        server_url: OpenCode server URL. Defaults to AUTO_SERVER_URL env or localhost:54321.
-        cwd: Working directory (unused currently, reserved for future).
-        session_id: Session ID to use. If not set, checks AUTO_SESSION_ID env.
-                    If neither is set, uses the most recent session.
     """
-    server_url = (server_url or os.environ.get("AUTO_SERVER_URL", "http://localhost:54321")).rstrip("/")
-    session_id = session_id or os.environ.get("AUTO_SESSION_ID")
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    pid = os.getpid()
+    cwd = str(Path.cwd().resolve())
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10.0)) as client:
-        session_id = await _get_or_create_session(client, server_url, session_id)
-        print(f"[auto] Using session: {session_id}")
-        print(f"[auto] Server: {server_url}")
+    print(f"[auto] Starting (PID {pid}, cwd={cwd})", flush=True)
+    if session_id:
+        print(f"[auto] Session: {session_id}", flush=True)
+    else:
+        print("[auto] WARNING: CLAUDE_CODE_SESSION_ID not set, session isolation disabled", flush=True)
 
-        step_count = 0
+    step_count = 0
 
-        async def step(instruction, schema=None):
-            """Send an instruction to the agent and get the result.
+    # Write a "starting" heartbeat before calling program_fn so that
+    # _start_program's bootstrap wait can detect Python is alive even if
+    # program_fn does substantial initialization before its first step() call.
+    # The hook treats "starting" like "pending" for Phase 2 (falls through to
+    # polling), so no instruction is injected until step() writes "pending".
+    _write_state({
+        "status": "starting",
+        "session_id": session_id,
+        "step_number": 0,
+        "instruction": None,
+        "schema": None,
+        "response": None,
+        "error": None,
+        "python_pid": pid,
+        "cwd": cwd,
+    })
 
-            Args:
-                instruction: What to do. Natural language.
-                schema: If provided, returns structured JSON output.
+    async def step(instruction, schema=None, schema_strict=True):
+        """Send an instruction to Claude and get the result.
 
-            Returns:
-                str (default) or dict (if schema provided).
-            """
-            nonlocal step_count
-            step_count += 1
-            print(f"[auto] Step {step_count}: {instruction[:80]}...")
-            result = await _send_step(client, server_url, session_id, instruction, schema)
-            result_preview = json.dumps(result)[:100] if isinstance(result, dict) else result[:100]
-            print(f"[auto] Step {step_count} result: {result_preview}")
-            return result
+        Args:
+            instruction: What to do. Natural language.
+            schema: If provided, returns structured JSON output.
+            schema_strict: If True (default), raises ValueError on JSON parse
+                failure. If False, returns {k: None for k in schema} instead.
 
+        Returns:
+            str (default) or dict (if schema provided).
+
+        Raises:
+            ValueError: if schema is provided, schema_strict is True, and the
+                response cannot be parsed as valid JSON.
+
+        Note: Call step() as early as possible in program_fn, before expensive
+            initialization. This ensures the hook sees "pending" quickly and
+            the bootstrap turn's instruction is injected without delay.
+        """
+        nonlocal step_count
+        step_count += 1
+        instr_preview = instruction[:80] if instruction else "(none)"
+        print(f"[auto] Step {step_count}: {instr_preview}...", flush=True)
+
+        # Write pending instruction
+        _write_state({
+            "status": "pending",
+            "session_id": session_id,
+            "step_number": step_count,
+            "instruction": instruction,
+            "schema": schema,
+            "response": None,
+            "error": None,
+            "python_pid": pid,
+            "cwd": cwd,
+        })
+
+        # Wait for response
+        response_text = await _wait_for_response(step_count)
+
+        if schema is None:
+            result_preview = response_text[:100] if response_text else "(empty)"
+            print(f"[auto] Step {step_count} result: {result_preview}", flush=True)
+            return response_text
+
+        # Parse JSON from response
+        try:
+            result = _extract_json(response_text)
+        except ValueError as e:
+            if schema_strict:
+                raise ValueError(
+                    f"[auto] Step {step_count}: JSON parse failed (schema_strict=True). "
+                    f"Response was: {response_text[:200]}"
+                ) from e
+            print(f"[auto] WARNING: Step {step_count}: JSON parse failed, returning nulls for schema keys", flush=True)
+            result = {k: None for k in schema}
+
+        result_preview = json.dumps(result)[:100]
+        print(f"[auto] Step {step_count} result: {result_preview}", flush=True)
+        return result
+
+    def _handle_sigterm(signum, frame):
+        raise SystemExit("Received SIGTERM")
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    try:
         await program_fn(step)
-        print(f"[auto] Program complete ({step_count} steps)")
+        print(f"[auto] Program complete ({step_count} steps)", flush=True)
+    except Exception as e:
+        print(f"[auto] Program CRASHED: {e}", flush=True)
+        _write_state({
+            "status": "error",
+            "session_id": session_id,
+            "step_number": step_count,
+            "instruction": None,
+            "schema": None,
+            "response": None,
+            "error": str(e),
+            "python_pid": pid,
+            "cwd": cwd,
+        })
+        raise
+    else:
+        _write_state({
+            "status": "done",
+            "session_id": session_id,
+            "step_number": step_count,
+            "instruction": None,
+            "schema": None,
+            "response": None,
+            "error": None,
+            "python_pid": pid,
+            "cwd": cwd,
+        })

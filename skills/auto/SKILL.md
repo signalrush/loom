@@ -11,20 +11,12 @@ Auto lets you write a Python program that controls agent execution. You write `a
 
 The Python program is the control flow. `step()` is the agent acting.
 
-## ⚠️ CRITICAL: Auto runs in its OWN session
-
-**auto-run creates a separate agent session.** It does NOT run in your current session. This means:
-
-- `auto-run` MUST be run **in the background** (`&` or `nohup`)
-- If you run it in the foreground, it will deadlock (your session blocks waiting for auto-run, auto-run blocks waiting for your session)
-- Monitor it via `auto-run status` and `auto-run log`
-
 ## How to Use
 
-### 1. Install (if not already)
+### 1. Setup (once per project)
 
 ```bash
-pip install -e /path/to/auto   # or: git clone + pip install -e .
+auto-run setup
 ```
 
 ### 2. Write a program
@@ -59,16 +51,13 @@ async def main(step):
 
 That's it. No imports needed beyond the `step` function passed to `main`.
 
-### 3. Run it (MUST be in background)
+### 3. Run it
 
 ```bash
-auto-run program.py &
+auto-run program.py
 ```
 
-Or use the built-in background mode:
-```bash
-nohup auto-run program.py > auto.log 2>&1 &
-```
+Then type **go** to start. Each step runs as a turn in your session — you can watch everything happen.
 
 ### 4. Monitor
 
@@ -166,4 +155,4 @@ async def main(step):
 
 ## Key insight
 
-`step()` drives a separate agent session. The Python program controls when and how the agent works. Auto-run must always be launched in the background to avoid deadlocking your current session.
+`step()` drives your session. The Python program controls when and how you work. Each step is a full turn with access to all tools.

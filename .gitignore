@@ -4,3 +4,4 @@ dist/
 .venv/
 auto.log
 .auto.pid
+.claude/auto-loop.json

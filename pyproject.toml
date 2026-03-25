@@ -5,9 +5,7 @@ description = "A single primitive for self-controlling agents"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
-dependencies = [
-    "httpx",
-]
+dependencies = []
 
 [project.scripts]
 auto-run = "auto.cli:main"
