@@ -95,6 +95,27 @@ start_program() {
     # Set up environment
     export LOOM_SERVER_URL="http://localhost:$port"
     
+    # Auto-detect current session ID if not set
+    # This allows loom programs to resume the caller's session
+    if [[ -z "${LOOM_SESSION_ID:-}" ]]; then
+        local detected_session
+        detected_session=$(curl -s "http://localhost:$port/session" 2>/dev/null | \
+            python3 -c "
+import json, sys
+try:
+    sessions = json.load(sys.stdin)
+    if sessions:
+        # Most recently updated session
+        latest = max(sessions, key=lambda s: s.get('time', {}).get('updated', 0))
+        print(latest['id'])
+except: pass
+" 2>/dev/null)
+        if [[ -n "$detected_session" ]]; then
+            export LOOM_SESSION_ID="$detected_session"
+            echo "Resuming session: $detected_session"
+        fi
+    fi
+    
     # Start program in background — loom-run wraps the user's main() with the runtime
     nohup python3 -c "
 import asyncio, importlib.util, sys, os

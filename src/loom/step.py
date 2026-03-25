@@ -3,9 +3,9 @@
 The model writes a program with def main(step). loom-run executes it,
 injecting step() which sends each instruction into the model's own session.
 
-    def main(step):
-        result = step("run train.py, report loss")
-        step(f"loss was {result}, try to improve it")
+    async def main(step):
+        result = await step("run train.py, report loss")
+        await step(f"loss was {result}, try to improve it")
 
 step(instruction) -> str
 step(instruction, schema={...}) -> dict
@@ -14,8 +14,7 @@ step(instruction, schema={...}) -> dict
 import json
 import re
 import os
-import asyncio
-from opencode_agent_sdk import SDKClient, AgentOptions, AssistantMessage, TextBlock
+import httpx
 
 
 def _extract_json(text):
@@ -52,8 +51,8 @@ def _extract_json(text):
     raise ValueError(f"Could not extract valid JSON from response: {text[:200]}")
 
 
-async def _send_step(client, instruction, schema=None):
-    """Send one step to the session and return the result."""
+async def _send_step(client, server_url, session_id, instruction, schema=None):
+    """Send one step to the session via REST API and return the result."""
     prompt = instruction
     if schema is not None:
         schema_desc = json.dumps(schema, indent=2)
@@ -66,46 +65,48 @@ async def _send_step(client, instruction, schema=None):
             f"Return ONLY the JSON object, no other text."
         )
 
-    await client.query(prompt)
+    resp = await client.post(
+        f"{server_url}/session/{session_id}/message",
+        json={"parts": [{"type": "text", "text": prompt}]},
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
+    # Extract text from response parts
     result = ""
-    async for msg in client.receive_response():
-        if isinstance(msg, AssistantMessage):
-            text = ""
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    text += block.text
-            if text:
-                result = text
+    parts = data.get("parts", [])
+    for part in parts:
+        if part.get("type") == "text":
+            result = part["text"]  # take the last text part
 
     if schema is not None:
         return _extract_json(result)
     return result
 
 
-async def run_program(program_fn, server_url=None, cwd=None):
+async def run_program(program_fn, server_url=None, cwd=None, session_id=None):
     """Execute a loom program.
 
     The program_fn receives a step() function that sends instructions
     into a persistent session. Context accumulates across steps.
 
     Args:
-        program_fn: A function that takes step as its argument.
-                    Can be sync (def main(step)) or async (async def main(step)).
+        program_fn: An async function that takes step as its argument.
         server_url: OpenCode server URL. Defaults to LOOM_SERVER_URL env or localhost:54321.
-        cwd: Working directory. Defaults to current directory.
+        cwd: Working directory (unused currently, reserved for future).
+        session_id: Session ID to resume. If not set, checks LOOM_SESSION_ID env var.
+                    If neither is set, creates a new session.
     """
-    server_url = server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")
-    cwd = cwd or os.getcwd()
+    server_url = (server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")).rstrip("/")
+    session_id = session_id or os.environ.get("LOOM_SESSION_ID")
 
-    client = SDKClient(options=AgentOptions(
-        server_url=server_url,
-        cwd=cwd,
-        permission_mode="auto",
-    ))
-    await client.connect()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+        # Create a new session if no session ID provided
+        if not session_id:
+            resp = await client.post(f"{server_url}/session")
+            resp.raise_for_status()
+            session_id = resp.json()["id"]
 
-    try:
         async def step(instruction, schema=None):
             """Send an instruction to the model and get the result.
 
@@ -116,11 +117,6 @@ async def run_program(program_fn, server_url=None, cwd=None):
             Returns:
                 str (default) or dict (if schema provided).
             """
-            return await _send_step(client, instruction, schema)
+            return await _send_step(client, server_url, session_id, instruction, schema)
 
-        result = program_fn(step)
-        # Support both sync and async main functions
-        if asyncio.iscoroutine(result):
-            await result
-    finally:
-        await client.disconnect()
+        await program_fn(step)
