@@ -14,6 +14,7 @@ step(instruction, schema={...}) -> dict
 import json
 import re
 import os
+import httpx
 
 
 def _extract_json(text):
@@ -50,48 +51,90 @@ def _extract_json(text):
     raise ValueError(f"Could not extract valid JSON from response: {text[:200]}")
 
 
-async def run_program(program_fn, server_url=None, cwd=None, session_id=None,
-                      model=None, provider_id=None, permission_mode="auto"):
+async def _send_step(client, server_url, session_id, instruction, schema=None):
+    """Send one step to the session via REST API and return the result."""
+    prompt = instruction
+    if schema is not None:
+        schema_desc = json.dumps(schema, indent=2)
+        prompt += (
+            f"\n\nRespond with ONLY a JSON object. The keys and their expected types are:\n"
+            f"{schema_desc}\n\n"
+            f"Replace the type descriptions with actual values. "
+            f"For example, if the schema is {{\"name\": \"str\", \"age\": \"int\"}}, "
+            f"you would return {{\"name\": \"Alice\", \"age\": 30}}.\n"
+            f"Return ONLY the JSON object, no other text."
+        )
+
+    resp = await client.post(
+        f"{server_url}/session/{session_id}/message",
+        json={"parts": [{"type": "text", "text": prompt}]},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # Extract text from response parts
+    result = ""
+    parts = data.get("parts", [])
+    for part in parts:
+        if part.get("type") == "text":
+            result = part["text"]  # take the last text part
+
+    if schema is not None:
+        return _extract_json(result)
+    return result
+
+
+async def _get_or_create_session(client, server_url, session_id=None):
+    """Get an existing session or create a new one.
+
+    If session_id is provided, uses that session directly.
+    Otherwise lists sessions and uses the most recent one,
+    or creates a new session if none exist.
+    """
+    if session_id:
+        return session_id
+
+    # List existing sessions and use the most recent
+    resp = await client.get(f"{server_url}/session")
+    resp.raise_for_status()
+    sessions = resp.json()
+
+    if sessions:
+        # Sort by updated time, use most recent
+        sessions.sort(key=lambda s: s.get("time", {}).get("updated", 0), reverse=True)
+        return sessions[0]["id"]
+
+    # No sessions exist, create one
+    resp = await client.post(f"{server_url}/session")
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+async def run_program(program_fn, server_url=None, cwd=None, session_id=None):
     """Execute a loom program.
 
     The program_fn receives a step() function that sends instructions
     into a persistent session. Context accumulates across steps — the model
     remembers everything from previous steps.
 
-    Uses the opencode-agent-sdk for session management. Supports two modes:
-    - HTTP mode (server_url set): connects to a running `opencode serve`
-    - Subprocess mode (default): spawns `opencode acp` directly
+    All steps run in the SAME session. If no session_id is provided,
+    loom connects to the most recent existing session (e.g. the one
+    visible in the TUI via `opencode attach`).
 
     Args:
         program_fn: An async function that takes step as its argument.
-        server_url: OpenCode server URL. If set, uses HTTP mode.
-                    Defaults to LOOM_SERVER_URL env var if set.
-        cwd: Working directory for the agent. Defaults to current dir.
-        session_id: Session ID to resume (subprocess mode only).
-        model: Model to use (e.g. "claude-haiku-4-5"). Defaults to LOOM_MODEL env.
-        provider_id: Provider ID (e.g. "anthropic"). Defaults to LOOM_PROVIDER env.
-        permission_mode: Permission mode for tool use. Defaults to "auto".
+        server_url: OpenCode server URL. Defaults to LOOM_SERVER_URL env or localhost:54321.
+        cwd: Working directory (unused currently, reserved for future).
+        session_id: Session ID to use. If not set, checks LOOM_SESSION_ID env var.
+                    If neither is set, uses the most recent session or creates one.
     """
-    from opencode_agent_sdk import SDKClient, AgentOptions
+    server_url = (server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")).rstrip("/")
+    session_id = session_id or os.environ.get("LOOM_SESSION_ID")
 
-    server_url = server_url or os.environ.get("LOOM_SERVER_URL", "")
-    model = model or os.environ.get("LOOM_MODEL", "")
-    provider_id = provider_id or os.environ.get("LOOM_PROVIDER", "anthropic")
-    cwd = cwd or os.getcwd()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+        session_id = await _get_or_create_session(client, server_url, session_id)
+        print(f"[loom] Using session: {session_id}")
 
-    options = AgentOptions(
-        cwd=cwd,
-        model=model,
-        provider_id=provider_id,
-        permission_mode=permission_mode,
-        server_url=server_url,
-        resume=session_id,
-    )
-
-    client = SDKClient(options=options)
-    await client.connect()
-
-    try:
         async def step(instruction, schema=None):
             """Send an instruction to the model and get the result.
 
@@ -102,36 +145,6 @@ async def run_program(program_fn, server_url=None, cwd=None, session_id=None,
             Returns:
                 str (default) or dict (if schema provided).
             """
-            prompt = instruction
-            if schema is not None:
-                schema_desc = json.dumps(schema, indent=2)
-                prompt += (
-                    f"\n\nRespond with ONLY a JSON object. The keys and their expected types are:\n"
-                    f"{schema_desc}\n\n"
-                    f"Replace the type descriptions with actual values. "
-                    f"For example, if the schema is {{\"name\": \"str\", \"age\": \"int\"}}, "
-                    f"you would return {{\"name\": \"Alice\", \"age\": 30}}.\n"
-                    f"Return ONLY the JSON object, no other text."
-                )
-
-            await client.query(prompt)
-
-            # Collect the full response
-            result_text = ""
-            async for msg in client.receive_response():
-                # SystemMessage has subtype; AssistantMessage has content
-                if hasattr(msg, 'content'):
-                    for block in msg.content:
-                        if hasattr(block, 'text'):
-                            result_text = block.text  # take last text block
-                # ResultMessage signals end of turn
-                if hasattr(msg, 'session_id') and hasattr(msg, 'is_error'):
-                    break
-
-            if schema is not None:
-                return _extract_json(result_text)
-            return result_text
+            return await _send_step(client, server_url, session_id, instruction, schema)
 
         await program_fn(step)
-    finally:
-        await client.disconnect()
