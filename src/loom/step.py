@@ -100,12 +100,13 @@ async def run_program(program_fn, server_url=None, cwd=None, session_id=None):
     server_url = (server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")).rstrip("/")
     session_id = session_id or os.environ.get("LOOM_SESSION_ID")
 
+    # Workaround for OpenCode serve bug: the server doesn't properly append
+    # user messages to session history, causing "assistant prefill" errors
+    # on the second step. We create a fresh session per step and include
+    # accumulated context in the prompt.
+    history = []  # list of (instruction, response) tuples
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
-        # Create a new session if no session ID provided
-        if not session_id:
-            resp = await client.post(f"{server_url}/session")
-            resp.raise_for_status()
-            session_id = resp.json()["id"]
 
         async def step(instruction, schema=None):
             """Send an instruction to the model and get the result.
@@ -117,6 +118,30 @@ async def run_program(program_fn, server_url=None, cwd=None, session_id=None):
             Returns:
                 str (default) or dict (if schema provided).
             """
-            return await _send_step(client, server_url, session_id, instruction, schema)
+            # Build context-enriched prompt from history
+            if history:
+                context_parts = ["[Previous steps in this session:]"]
+                for i, (prev_instr, prev_resp) in enumerate(history, 1):
+                    context_parts.append(f"\n--- Step {i} ---")
+                    context_parts.append(f"Instruction: {prev_instr}")
+                    context_parts.append(f"Response: {prev_resp}")
+                context_parts.append(f"\n--- Current step (step {len(history) + 1}) ---")
+                context_parts.append(instruction)
+                full_instruction = "\n".join(context_parts)
+            else:
+                full_instruction = instruction
+
+            # Create a fresh session for each step to avoid prefill bug
+            resp = await client.post(f"{server_url}/session")
+            resp.raise_for_status()
+            step_session_id = resp.json()["id"]
+
+            result = await _send_step(client, server_url, step_session_id, full_instruction, schema)
+
+            # Store raw instruction and result for context
+            result_str = json.dumps(result) if isinstance(result, dict) else result
+            history.append((instruction, result_str))
+
+            return result
 
         await program_fn(step)
