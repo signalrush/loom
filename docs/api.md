@@ -1,15 +1,24 @@
 # API Reference
 
-## `step(instruction, context=None, schema=None)`
+## `async def main(step)`
 
-The single primitive. Each call is one full agent turn — fresh context window, full tool access.
+The main program pattern. Write a function that takes `step` as its argument. The `step` function sends instructions into your persistent session.
+
+```python
+async def main(step):
+    result = await step("What files are in the current directory?")
+    print(result)
+```
+
+## `step(instruction, schema=None)`
+
+The single primitive. Each call is one full agent turn in a persistent session where context accumulates.
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `instruction` | `str` | required | What to do. Natural language. |
-| `context` | `str \| dict \| None` | `None` | What this step can see. Previous results, state, file contents. Passed as a string prefix to the prompt. |
 | `schema` | `dict \| None` | `None` | If provided, the step must return structured output matching this schema. Keys are field names, values are type descriptions. |
 
 ### Returns
@@ -20,69 +29,56 @@ The single primitive. Each call is one full agent turn — fresh context window,
 ### Examples
 
 ```python
-from loom import step
+async def main(step):
+    # Simple instruction
+    result = await step("What files are in the current directory?")
 
-# Simple instruction
-result = await step("What files are in the current directory?")
-
-# With context
-result = await step(
-    "What experiment should I try next?",
-    context={"best_score": 0.85, "tried": ["lr=0.01", "lr=0.001"]}
-)
-
-# With schema
-result = await step(
-    "Run the training script and report results.",
-    schema={"loss": "float", "accuracy": "float", "epochs": "int"}
-)
-# result = {"loss": 0.23, "accuracy": 0.91, "epochs": 10}
+    # With schema
+    result = await step(
+        "Run the training script and report results.",
+        schema={"loss": "float", "accuracy": "float", "epochs": "int"}
+    )
+    # result = {"loss": 0.23, "accuracy": 0.91, "epochs": 10}
 ```
 
 ---
 
-## `StepRuntime`
+## `run_program(program_fn, server_url=None, cwd=None)`
 
-Manages the connection to an OpenCode server. The module-level `step()` function uses a default runtime instance.
+Executes a loom program by connecting to an OpenCode server and passing a `step` function to your main function.
 
-### Constructor
-
-```python
-StepRuntime(server_url="http://localhost:54321", cwd=".")
-```
+### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `server_url` | `str` | `"http://localhost:54321"` | OpenCode server URL. |
-| `cwd` | `str` | `"."` | Working directory for agent tool execution. |
-
-### Methods
-
-#### `async step(instruction, context=None, schema=None)`
-
-Same as the module-level `step()`. See above.
+| `program_fn` | `function` | required | Your main function that takes `step` as argument. Can be sync or async. |
+| `server_url` | `str` | `None` | OpenCode server URL. Defaults to `LOOM_SERVER_URL` env var or `http://localhost:54321`. |
+| `cwd` | `str` | `None` | Working directory for agent tool execution. Defaults to current directory. |
 
 ### Example
 
 ```python
-from loom import StepRuntime
+from loom import run_program
 
-rt = StepRuntime(server_url="http://localhost:54321", cwd="/path/to/project")
+async def main(step):
+    result = await step("Run tests and fix any failures.")
+    print(result)
 
-result = await rt.step("Run tests and fix any failures.")
+# Run the program
+await run_program(main)
 ```
 
 ---
 
 ## Key Behaviors
 
-### Fresh session per step
+### Persistent session across steps
 
-Each `step()` call creates a new OpenCode session. Step 100 has the same clean context as step 1. Cross-step state is passed explicitly through `context`, not accumulated in a context window.
+All `step()` calls operate within a single OpenCode session. Step 100 remembers everything from steps 1-99. Context accumulates naturally, while Python provides control flow and structured state management.
 
 ### Tool access
 
-Inside a step, the model has full access to bash, file read/write, and any configured MCP servers. The caller doesn't manage tools — `step()` is a complete agent turn.
+Inside a step, the model has full access to bash, file read/write, and any configured MCP servers. The caller doesn't manage tools — `step()` is a complete agent turn that accumulates context.
 
 ### Schema extraction
 

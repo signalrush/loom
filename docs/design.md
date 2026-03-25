@@ -162,23 +162,23 @@ Guardrailing is just an if-statement between two steps. The check can't be skipp
 The `program.md` pattern — expressed as an actual program:
 
 ```python
-baseline = step("run train.py as-is, report val_bpb",
-                schema={"val_bpb": float})
-best = baseline.val_bpb
+async def main(step):
+    baseline = await step("run train.py as-is, report val_bpb",
+                    schema={"val_bpb": "float"})
+    best = baseline["val_bpb"]
 
-while True:
-    result = step(
-        "propose and run one experiment on train.py, "
-        "commit before running, report result",
-        {"best_so_far": best, "results": read("results.tsv")},
-        schema={"val_bpb": float, "description": str, "status": str}
-    )
+    while True:
+        result = await step(
+            "propose and run one experiment on train.py, "
+            "commit before running, report result",
+            schema={"val_bpb": "float", "description": "str", "status": "str"}
+        )
 
-    if result.val_bpb < best:
-        best = result.val_bpb
+        if result["val_bpb"] < best:
+            best = result["val_bpb"]
 
-    if experiments % 10 == 0:
-        step("review results.tsv, reflect on what's working, adjust strategy")
+        if experiments % 10 == 0:
+            await step("review results.tsv, reflect on what's working, adjust strategy")
 ```
 
 vs. `program.md` which says the same thing in English and relies on the model to maintain the loop, remember the best score, and count experiments. Here, Python does all of that reliably.
@@ -251,49 +251,51 @@ This maps directly onto `step()`: each step is a `query()` → `receive_response
 ### step() Implementation
 
 ```python
-from opencode_agent_sdk import SDKClient, AgentOptions, AssistantMessage, TextBlock
-import json
+async def run_program(program_fn, server_url=None, cwd=None):
+    """Execute a loom program.
 
-class StepRuntime:
-    def __init__(self, server_url="http://localhost:54321", cwd="."):
-        self.server_url = server_url
-        self.cwd = cwd
+    The program_fn receives a step() function that sends instructions
+    into a persistent session. Context accumulates across steps.
 
-    async def step(self, instruction, context=None, schema=None):
-        # Build prompt
-        prompt = instruction
-        if context is not None:
-            prompt = f"Context:\n{context}\n\nTask: {instruction}"
-        if schema is not None:
-            prompt += f"\n\nYou must return valid JSON matching this schema: {json.dumps(schema)}"
+    Args:
+        program_fn: A function that takes step as its argument.
+                    Can be sync (def main(step)) or async (async def main(step)).
+        server_url: OpenCode server URL. Defaults to LOOM_SERVER_URL env or localhost:54321.
+        cwd: Working directory. Defaults to current directory.
+    """
+    server_url = server_url or os.environ.get("LOOM_SERVER_URL", "http://localhost:54321")
+    cwd = cwd or os.getcwd()
 
-        # Each step = fresh session (fresh context window)
-        client = SDKClient(options=AgentOptions(
-            server_url=self.server_url,
-            cwd=self.cwd,
-        ))
-        await client.connect()
-        await client.query(prompt)
+    client = SDKClient(options=AgentOptions(
+        server_url=server_url,
+        cwd=cwd,
+    ))
+    await client.connect()
 
-        # Collect response
-        result = ""
-        async for msg in client.receive_response():
-            if isinstance(msg, AssistantMessage):
-                for block in msg.content:
-                    if isinstance(block, TextBlock):
-                        result += block.text
+    try:
+        async def step(instruction, schema=None):
+            """Send an instruction to the model and get the result.
 
+            Args:
+                instruction: What to do. Natural language.
+                schema: If provided, returns structured JSON output.
+
+            Returns:
+                str (default) or dict (if schema provided).
+            """
+            return await _send_step(client, instruction, schema)
+
+        result = program_fn(step)
+        # Support both sync and async main functions
+        if asyncio.iscoroutine(result):
+            await result
+    finally:
         await client.disconnect()
-
-        # Parse schema if needed
-        if schema is not None:
-            return json.loads(result)  # runtime validates against schema
-        return result
 ```
 
 ### Key Design Decisions
 
-**Fresh session per step.** Each `step()` creates a new session. This guarantees fresh context — step 100 is as clean as step 1. Cross-step state is passed explicitly through the `context` parameter, not accumulated in a context window.
+**Persistent session across steps.** `step()` operates within a single persistent session where context accumulates across calls. The model remembers all previous steps. This provides continuity while Python provides control flow and structured state management.
 
 **OpenCode handles tool execution.** The model inside a step has full access to bash, file editing, etc. The `step()` caller doesn't need to know or manage tools. This is what makes `step()` a full agent turn, not just a text completion.
 
@@ -323,13 +325,9 @@ When a user sends a message during a running step, the hook denies the current t
 ### Autoresearch Example with OpenCode
 
 ```python
-import asyncio
-
-async def main():
-    rt = StepRuntime(server_url="http://localhost:54321", cwd="/path/to/autoresearch")
-
+async def main(step):
     # Baseline
-    baseline = await rt.step(
+    baseline = await step(
         "Run `uv run train.py > run.log 2>&1`, then `grep '^val_bpb:' run.log`. Report the val_bpb.",
         schema={"val_bpb": "float"}
     )
@@ -338,25 +336,22 @@ async def main():
     count = 0
     while True:
         count += 1
-        result = await rt.step(
+        result = await step(
             "Propose one experiment. Edit train.py, git commit, run it, report results.",
-            context={"best_so_far": best, "experiment_number": count},
             schema={"val_bpb": "float", "description": "str", "status": "str"}
         )
 
         if result["val_bpb"] < best:
             best = result["val_bpb"]
-            await rt.step(f"Log keep to results.tsv: {result['description']}, val_bpb={result['val_bpb']}")
+            await step(f"Log keep to results.tsv: {result['description']}, val_bpb={result['val_bpb']}")
         else:
-            await rt.step(f"Log discard to results.tsv: {result['description']}. Git reset to previous commit.")
+            await step(f"Log discard to results.tsv: {result['description']}. Git reset to previous commit.")
 
         if count % 10 == 0:
-            await rt.step("Read results.tsv. Reflect on what directions are working. Adjust strategy for next experiments.")
-
-asyncio.run(main())
+            await step("Read results.tsv. Reflect on what directions are working. Adjust strategy for next experiments.")
 ```
 
-This program runs indefinitely. Each step is a fresh context. The Python loop handles state (best score, count), branching (keep/discard), and periodic replanning. OpenCode handles the actual coding agent work inside each step.
+This program runs indefinitely within a persistent session. The Python loop handles state (best score, count), branching (keep/discard), and periodic replanning. Each step accumulates context, allowing the model to remember all previous experiments.
 
 ## Integration: Loom as an Agent Skill
 
@@ -378,9 +373,9 @@ The OpenCode server is the brain. The TUI is a window. Loom programs are another
 
 The model inside the TUI:
 
-1. **Installs the skill** — `pip install loom-agent` (or it's pre-installed in the environment)
-2. **Reads the skill instructions** — learns how to write `step()` programs
-3. **Writes `program.py`** — a Python script composing `step()` calls
+1. **Installs the skill** — `npx skills add signalrush/loom` (or it's pre-installed in the environment)
+2. **Reads the skill instructions** — learns how to write `async def main(step)` programs
+3. **Writes `program.py`** — a Python script with `async def main(step)` pattern
 4. **Runs `loom-run program.py`** — a wrapper script that handles plumbing
 5. **Checks progress** — reads `loom-state.json` or `loom-run status`
 
@@ -406,9 +401,9 @@ What `loom-run` does internally:
 Programs use a `state` helper to write progress:
 
 ```python
-from loom import step, state
+from loom import state
 
-async def main():
+async def main(step):
     state.set("status", "running")
     
     baseline = await step("run train.py", schema={"loss": "float"})
@@ -417,7 +412,6 @@ async def main():
     for i in range(100):
         result = await step(
             "propose and run an experiment",
-            context=state.get(),
             schema={"loss": "float", "description": "str"}
         )
         if result["loss"] < state.get("best_loss"):
@@ -456,7 +450,7 @@ skills/loom/
 ### Why this works
 
 - **No MCP, no special protocol** — just Python + HTTP
-- **No context pollution** — each step() is a fresh session, the TUI stays clean
+- **Persistent session context** — step() operates within a continuous session, maintaining conversation history while Python manages control flow
 - **Model writes the program** — full control over execution flow
 - **Visible state** — JSON files the model can read anytime
 - **Same server** — loom uses the same backend as the TUI, same tools, same filesystem
@@ -468,7 +462,7 @@ skills/loom/
 
 2. **Error handling.** What happens when a step fails? Python try/except is the obvious answer, but does the model write good error handling?
 
-3. **Context window within a step.** If a single step involves many tool calls, it still faces context accumulation within that step. Step boundaries help but don't eliminate the problem.
+
 
 4. **Training.** Models aren't specifically trained to write `step()` programs. How much does this matter? Is Python fluency enough, or do you need RL on step-composition specifically?
 

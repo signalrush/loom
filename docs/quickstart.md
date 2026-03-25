@@ -9,6 +9,12 @@
 ## Install
 
 ```bash
+npx skills add signalrush/loom
+```
+
+Or manually:
+
+```bash
 pip install loom-agent
 ```
 
@@ -28,10 +34,8 @@ opencode serve --port 54321
 ## Write a program
 
 ```python
-import asyncio
-from loom import step
-
-async def main():
+# program.py
+async def main(step):
     # A single step — one agent turn
     result = await step("What is 2 + 2? Just the number.")
     print(result)  # "4"
@@ -46,8 +50,12 @@ async def main():
         schema={"files": [{"name": "str", "lines": "int"}]}
     )
     print(result)  # {"files": [{"name": "main.py", "lines": 42}, ...]}
+```
 
-asyncio.run(main())
+## Run it
+
+```bash
+loom-run program.py
 ```
 
 ## Write a loop
@@ -55,10 +63,8 @@ asyncio.run(main())
 The power of `step()` is that the model controls the flow, but Python controls the state:
 
 ```python
-import asyncio
-from loom import step
-
-async def main():
+# autoresearch.py
+async def main(step):
     # Get baseline
     baseline = await step(
         "Run `python train.py` and report the validation loss.",
@@ -69,7 +75,6 @@ async def main():
     for i in range(20):
         result = await step(
             "Propose and run one experiment. Edit train.py, run it, report results.",
-            context={"best_so_far": best, "experiment_number": i + 1},
             schema={"val_loss": "float", "description": "str"}
         )
 
@@ -78,11 +83,9 @@ async def main():
             print(f"New best: {best} — {result['description']}")
         else:
             await step("Revert the last change. Git reset to previous commit.")
-
-asyncio.run(main())
 ```
 
-Each step is a fresh context window. The Python loop handles state, branching, and control flow. The model handles the actual coding work inside each step.
+Run with `loom-run autoresearch.py`. The session persists across all steps — the model remembers every experiment. The Python loop handles state, branching, and control flow. The model handles the actual coding work inside each step.
 
 ## Next steps
 
