@@ -242,6 +242,7 @@ async def run_program(program_fn):
             "error": None,
             "python_pid": pid,
             "cwd": cwd,
+            "transcript_lines": None,
         })
 
         # Wait for response

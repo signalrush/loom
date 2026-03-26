@@ -56,9 +56,17 @@ if [[ "$STATUS" == "running" ]]; then
 
   LAST_OUTPUT=""
   if [[ -f "$TRANSCRIPT_PATH" ]]; then
-    LAST_OUTPUT=$(tail -n 200 "$TRANSCRIPT_PATH" | jq -rs '
-      [.[] | select(.role == "assistant") | .message.content[]? | select(.type == "text") | .text] | join("\n")
-    ' 2>/dev/null)
+    PREV_LINES=$(echo "$STATE" | jq -r '.transcript_lines // -1' 2>/dev/null)
+    if [[ "$PREV_LINES" -ge 0 ]]; then
+      LAST_OUTPUT=$(tail -n +"$((PREV_LINES + 1))" "$TRANSCRIPT_PATH" | jq -rs '
+        [.[] | select(.role == "assistant") | .message.content[]? | select(.type == "text") | .text] | join("\n")
+      ' 2>/dev/null)
+    else
+      # Fallback: no line count recorded, use tail -n 200
+      LAST_OUTPUT=$(tail -n 200 "$TRANSCRIPT_PATH" | jq -rs '
+        [.[] | select(.role == "assistant") | .message.content[]? | select(.type == "text") | .text] | join("\n")
+      ' 2>/dev/null)
+    fi
   fi
 
   # Write response atomically
@@ -130,12 +138,20 @@ Replace the type descriptions with actual values. For example, if the schema is 
 Return ONLY the JSON object, no other text."
     fi
 
+    # Count current transcript lines so Phase 1 knows where the current turn starts
+    TRANSCRIPT_PATH_FOR_COUNT=$(echo "$HOOK_INPUT" | jq -r '.transcript_path' 2>/dev/null)
+    CURRENT_LINES=0
+    if [[ -f "$TRANSCRIPT_PATH_FOR_COUNT" ]]; then
+        CURRENT_LINES=$(grep -c '' "$TRANSCRIPT_PATH_FOR_COUNT")
+    fi
+
     # Mark as running atomically
     TEMP_FILE="${STATE_FILE}.tmp.$$"
     echo "$STATE" | jq \
       --arg status "running" \
       --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-      '.status = $status | .updated_at = $updated_at' \
+      --argjson transcript_lines "$CURRENT_LINES" \
+      '.status = $status | .transcript_lines = $transcript_lines | .updated_at = $updated_at' \
       > "$TEMP_FILE" 2>/dev/null
     JQ_EXIT=$?
     if [[ $JQ_EXIT -ne 0 ]]; then

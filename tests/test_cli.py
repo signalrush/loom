@@ -288,6 +288,42 @@ def test_hook_transcript_tail_jq_returns_last_assistant_text(tmp_path):
     assert output == "hello from assistant", f"Got: {output!r}"
 
 
+def test_hook_only_extracts_current_turn_text(tmp_path):
+    """Hook Phase 1 must only extract text from the CURRENT turn, not prior turns.
+
+    Simulates a transcript with two turns. transcript_lines points past turn 1.
+    Only turn 2's text should appear in the extraction result.
+    """
+    transcript_path = tmp_path / "transcript.jsonl"
+    # Turn 1 lines (lines 1–2): old assistant text with stale JSON
+    turn1_lines = [
+        '{"type": "message", "role": "user", "message": {"content": [{"type": "text", "text": "q1"}]}}',
+        '{"type": "message", "role": "assistant", "message": {"content": [{"type": "text", "text": "{\\"old\\": true}"}]}}',
+    ]
+    # Turn 2 lines (lines 3–4): new assistant text with fresh JSON
+    turn2_lines = [
+        '{"type": "message", "role": "user", "message": {"content": [{"type": "text", "text": "q2"}]}}',
+        '{"type": "message", "role": "assistant", "message": {"content": [{"type": "text", "text": "{\\"new\\": true}"}]}}',
+    ]
+    transcript_path.write_text("\n".join(turn1_lines + turn2_lines) + "\n")
+
+    # PREV_LINES is 2: the hook recorded the line count after turn 1 was written
+    prev_lines = len(turn1_lines)
+
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            f"tail -n +{prev_lines + 1} {transcript_path}"
+            f" | jq -rs '[.[] | select(.role == \"assistant\") | .message.content[]? | select(.type == \"text\") | .text] | join(\"\\n\")'"
+        ],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"tail/jq failed: {result.stderr}"
+    output = result.stdout.strip()
+    assert '{"new": true}' in output, f"Expected new-turn JSON in output, got: {output!r}"
+    assert '{"old": true}' not in output, f"Old-turn JSON must NOT appear in output, got: {output!r}"
+
+
 def test_hook_transcript_tail_jq_returns_all_assistant_text_joined(tmp_path):
     """When multiple assistant turns exist, jq join returns all text concatenated."""
     transcript_path = tmp_path / "transcript.jsonl"
