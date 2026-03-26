@@ -253,17 +253,39 @@ async def run_program(program_fn):
             print(f"[auto] Step {step_count} result: {result_preview}", flush=True)
             return response_text
 
-        # Parse JSON from response
-        try:
-            result = _extract_json(response_text)
-        except ValueError as e:
-            if schema_strict:
-                raise ValueError(
-                    f"[auto] Step {step_count}: JSON parse failed (schema_strict=True). "
-                    f"Response was: {response_text[:200]}"
-                ) from e
-            print(f"[auto] WARNING: Step {step_count}: JSON parse failed, returning nulls for schema keys", flush=True)
-            result = {k: None for k in schema}
+        # Parse JSON from response, retry up to 3 times
+        for attempt in range(3):
+            try:
+                result = _extract_json(response_text)
+                break
+            except ValueError:
+                if attempt < 2:
+                    # Retry: ask the model to reformat
+                    step_count += 1
+                    retry_prompt = f"Your previous response was not valid JSON. Respond with a JSON object with these keys: {json.dumps(schema)}"
+                    print(f"[auto] Step {step_count}: JSON retry {attempt + 1}/2...", flush=True)
+                    _write_state({
+                        "status": "pending",
+                        "session_id": session_id,
+                        "step_number": step_count,
+                        "instruction": retry_prompt,
+                        "schema": schema,
+                        "response": None,
+                        "error": None,
+                        "python_pid": pid,
+                        "cwd": cwd,
+                        "transcript_lines": None,
+                    })
+                    response_text = await _wait_for_response(step_count)
+                else:
+                    # Final attempt failed
+                    if schema_strict:
+                        raise ValueError(
+                            f"[auto] Step {step_count}: JSON parse failed after 3 attempts. "
+                            f"Response was: {response_text[:200]}"
+                        )
+                    print(f"[auto] WARNING: Step {step_count}: JSON parse failed after 3 attempts, returning nulls", flush=True)
+                    result = {k: None for k in schema}
 
         result_preview = json.dumps(result)[:100]
         print(f"[auto] Step {step_count} result: {result_preview}", flush=True)
