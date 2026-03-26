@@ -181,7 +181,9 @@ async def run_program(program_fn):
     pid = os.getpid()
     cwd = str(Path.cwd().resolve())
 
-    print(f"[auto] Starting (PID {pid}, cwd={cwd})", flush=True)
+    import datetime
+    print(f"\n{'='*60}", flush=True)
+    print(f"[auto] {datetime.datetime.now().isoformat()} Starting (PID {pid}, cwd={cwd})", flush=True)
     if session_id:
         print(f"[auto] Session: {session_id}", flush=True)
     else:

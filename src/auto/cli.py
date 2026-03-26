@@ -205,7 +205,7 @@ def _start_program(program_path):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    log_fh = open(LOG_FILE, "w")
+    log_fh = open(LOG_FILE, "a")
     proc = subprocess.Popen(
         [sys.executable, "-c", f"""
 import asyncio, importlib.util, sys, os
