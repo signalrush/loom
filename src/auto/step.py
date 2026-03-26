@@ -438,3 +438,35 @@ async def run_program(program_fn):
             "python_pid": pid,
             "cwd": cwd,
         })
+
+
+async def run_program_v2(program_fn):
+    """Execute an auto program using the Auto orchestration object."""
+    from auto.core import Auto
+
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    pid = os.getpid()
+
+    import datetime
+    print(f"\n{'='*60}", flush=True)
+    _log(f"{datetime.datetime.now().isoformat()} Starting v2 (PID {pid})")
+
+    auto = Auto(session_id=session_id)
+    _log(f"Run dir: {auto.run_dir}")
+
+    def _handle_sigterm(signum, frame):
+        raise SystemExit("Received SIGTERM")
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    try:
+        await program_fn(auto)
+        _log(f"Program complete ({auto._step_count} steps)")
+    except SystemExit as e:
+        _log(f"Program terminated: {e}")
+        raise
+    except Exception as e:
+        import traceback
+        _log(f"Program CRASHED: {type(e).__name__}: {e}")
+        _log(f"Traceback:\n{traceback.format_exc()}")
+        raise

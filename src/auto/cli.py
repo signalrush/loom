@@ -142,15 +142,20 @@ def _start_program(program_path):
     try:
         proc = subprocess.Popen(
             [sys.executable, "-c", f"""
-import asyncio, importlib.util, sys, os
-# Set cwd to project root so state file resolves correctly
+import asyncio, importlib.util, sys, os, inspect
 os.chdir({cwd!r})
 sys.path.insert(0, os.getcwd())
 spec = importlib.util.spec_from_file_location('program', {program_path!r})
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-from auto.step import run_program
-asyncio.run(run_program(mod.main))
+
+params = list(inspect.signature(mod.main).parameters.keys())
+if params and params[0] == 'auto':
+    from auto.step import run_program_v2
+    asyncio.run(run_program_v2(mod.main))
+else:
+    from auto.step import run_program
+    asyncio.run(run_program(mod.main))
 """],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
