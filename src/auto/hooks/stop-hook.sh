@@ -52,7 +52,9 @@ fi
 
 # --- Phase 1: Deliver response if Claude just finished a step ---
 if [[ "$STATUS" == "running" ]]; then
+  echo "[auto] Phase 1: status=running, step=$STEP_NUMBER, delivering response" >&2
   TRANSCRIPT_PATH=$(echo "$HOOK_INPUT" | jq -r '.transcript_path' 2>/dev/null)
+  echo "[auto] Phase 1: transcript=$TRANSCRIPT_PATH" >&2
 
   LAST_OUTPUT=""
   if [[ -f "$TRANSCRIPT_PATH" ]]; then
@@ -87,7 +89,12 @@ if [[ "$STATUS" == "running" ]]; then
     if [[ $POLL_ATTEMPTS -ge $MAX_POLL ]]; then
       echo "[auto] Phase 1: transcript text still empty after ${MAX_POLL} polls" >&2
     fi
+  else
+    echo "[auto] Phase 1: transcript file not found: $TRANSCRIPT_PATH" >&2
   fi
+
+  RESPONSE_LEN=${#LAST_OUTPUT}
+  echo "[auto] Phase 1: extracted response (${RESPONSE_LEN} bytes), first 100: ${LAST_OUTPUT:0:100}" >&2
 
   # Write response atomically
   TEMP_FILE="${STATE_FILE}.tmp.$$"
@@ -99,11 +106,12 @@ if [[ "$STATUS" == "running" ]]; then
     > "$TEMP_FILE" 2>/dev/null
   JQ_EXIT=$?
   if [[ $JQ_EXIT -ne 0 ]]; then
-    echo "[auto] jq failed writing responded state, bailing" >&2
+    echo "[auto] Phase 1: jq FAILED (exit=$JQ_EXIT) writing responded state, bailing" >&2
     rm -f "$TEMP_FILE"
     exit 0
   fi
   mv "$TEMP_FILE" "$STATE_FILE"
+  echo "[auto] Phase 1: wrote responded (step=$STEP_NUMBER, ${RESPONSE_LEN}b)" >&2
 fi
 
 # --- Phase 2: Wait for next instruction from Python ---
@@ -134,12 +142,15 @@ while true; do
   if [[ "$PYTHON_PID" -gt 0 ]]; then
     kill -0 "$PYTHON_PID" 2>/dev/null
     if [[ $? -ne 0 ]]; then
+      echo "[auto] Phase 2: Python PID $PYTHON_PID is DEAD, cleaning up" >&2
       rm -f "$STATE_FILE"
       exit 0
     fi
   fi
 
   if [[ "$STATUS" == "pending" ]]; then
+    PENDING_STEP=$(echo "$STATE" | jq -r '.step_number // 0' 2>/dev/null)
+    echo "[auto] Phase 2: found pending step=$PENDING_STEP, injecting" >&2
     INSTRUCTION=$(echo "$STATE" | jq -r '.instruction // ""' 2>/dev/null)
     SCHEMA=$(echo "$STATE" | jq -r '.schema // "null"' 2>/dev/null)
 
@@ -172,11 +183,12 @@ ${SCHEMA_DESC}"
       > "$TEMP_FILE" 2>/dev/null
     JQ_EXIT=$?
     if [[ $JQ_EXIT -ne 0 ]]; then
-      echo "[auto] jq failed writing running state, bailing" >&2
+      echo "[auto] Phase 2: jq FAILED (exit=$JQ_EXIT) writing running state, bailing" >&2
       rm -f "$TEMP_FILE"
       exit 0
     fi
     mv "$TEMP_FILE" "$STATE_FILE"
+    echo "[auto] Phase 2: wrote running (step=$PENDING_STEP, tl=$CURRENT_LINES), injecting prompt (${#PROMPT} chars)" >&2
 
     # Block and inject instruction
     # B13: --arg properly escapes the value; PROMPT is double-quoted here
