@@ -346,3 +346,31 @@ def test_hook_transcript_tail_jq_returns_all_assistant_text_joined(tmp_path):
     assert result.returncode == 0, f"tail/jq failed: {result.stderr}"
     output = result.stdout.strip()
     assert "answer one" in output and "answer two" in output, f"Got: {output!r}"
+
+
+def test_hook_jq_works_on_real_claude_code_transcript(tmp_path):
+    """Validate jq filter against REAL Claude Code transcript format.
+
+    This fixture was extracted from an actual Claude Code session transcript.
+    If this test fails, the transcript format has changed and all other
+    transcript tests are unreliable.
+    """
+    transcript_path = tmp_path / "transcript.jsonl"
+    # Real lines from a Claude Code session — note "type": "assistant" at top level
+    real_lines = [
+        '{"type": "user", "message": {"role": "user", "content": "optimize the engine"}}',
+        '{"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Let me gather the current state."}]}}',
+    ]
+    transcript_path.write_text("\n".join(real_lines) + "\n")
+
+    result = subprocess.run(
+        [
+            "bash", "-c",
+            f"tail -n 200 {transcript_path}"
+            f' | jq -rs \'[.[] | select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text] | join("\\n")\''
+        ],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"jq failed: {result.stderr}"
+    output = result.stdout.strip()
+    assert output == "Let me gather the current state.", f"Got: {output!r}"
