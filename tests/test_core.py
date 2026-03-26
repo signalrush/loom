@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch, MagicMock
 
 from auto.core import Auto
+from auto.agents import AgentHandle
 
 
 class TestAutoInit:
@@ -87,3 +88,72 @@ class TestAutoRemind:
             asyncio.run(auto.remind("second"))
 
         assert auto._step_count == 2
+
+
+def _mock_completed_process(result_text="done", session_id="test-uuid"):
+    import json
+    from unittest.mock import MagicMock
+    output = json.dumps({"result": result_text, "session_id": session_id})
+    mock = MagicMock()
+    mock.returncode = 0
+    mock.stdout = output
+    mock.stderr = ""
+    return mock
+
+
+class TestAutoTask:
+    def test_task_creates_agent_implicitly(self, tmp_path):
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
+        with patch("auto.agents.subprocess.run",
+                   return_value=_mock_completed_process("done", "uuid-1")):
+            result = asyncio.run(auto.task("do X", to="helper"))
+        assert result == "done"
+        assert "helper" in auto._agents
+
+    def test_task_uses_declared_cwd(self, tmp_path):
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
+        auto.agent("coder", cwd="/custom/path")
+        with patch("auto.agents.subprocess.run",
+                   return_value=_mock_completed_process("fixed")) as mock_run:
+            asyncio.run(auto.task("fix bug", to="coder"))
+        assert mock_run.call_args[1]["cwd"] == "/custom/path"
+
+    def test_task_with_schema_parses_json(self, tmp_path):
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
+        result_text = '{"approved": true, "reason": "looks good"}'
+        with patch("auto.agents.subprocess.run",
+                   return_value=_mock_completed_process(result_text, "uuid-1")):
+            result = asyncio.run(
+                auto.task("review", to="reviewer",
+                          schema={"approved": "bool", "reason": "str"})
+            )
+        assert result["approved"] is True
+
+    def test_task_persists_session_across_calls(self, tmp_path):
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
+        with patch("auto.agents.subprocess.run",
+                   return_value=_mock_completed_process("r1", "uuid-first")):
+            asyncio.run(auto.task("first", to="coder"))
+        with patch("auto.agents.subprocess.run",
+                   return_value=_mock_completed_process("r2", "uuid-first")) as mock_run:
+            asyncio.run(auto.task("second", to="coder"))
+        cmd = mock_run.call_args[0][0]
+        assert "--resume" in cmd
+        assert "uuid-first" in cmd
+
+
+class TestAutoCleanup:
+    def test_cleanup_writes_stopped_state(self, tmp_path):
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
+        auto.agent("coder")
+        handle = AgentHandle("coder", cwd=str(tmp_path),
+                            state_path=auto.run_dir / "coder.json",
+                            log_path=auto.run_dir / "logs" / "coder.log")
+        auto._agents["coder"]["_handle"] = handle
+        auto.cleanup()
+        state = json.loads((auto.run_dir / "coder.json").read_text())
+        assert state["status"] == "stopped"
+
+    def test_cleanup_no_agents_is_safe(self, tmp_path):
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
+        auto.cleanup()  # Should not raise

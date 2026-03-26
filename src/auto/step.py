@@ -470,3 +470,5 @@ async def run_program_v2(program_fn):
         _log(f"Program CRASHED: {type(e).__name__}: {e}")
         _log(f"Traceback:\n{traceback.format_exc()}")
         raise
+    finally:
+        auto.cleanup()

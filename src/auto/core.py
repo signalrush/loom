@@ -84,10 +84,61 @@ class Auto:
 
     async def task(self, instruction: str, to: str, schema: dict = None,
                    timeout: int = None) -> str | dict:
-        """Placeholder — implemented in Phase 2."""
+        """Assign work to another agent via claude -p subprocess."""
         if to not in self._agents:
             self.agent(to)
-        raise NotImplementedError("task() will be implemented in Phase 2")
+
+        agent_config = self._agents[to]
+        if "_handle" not in agent_config:
+            from auto.agents import AgentHandle
+            agent_config["_handle"] = AgentHandle(
+                name=to,
+                cwd=agent_config["cwd"],
+                state_path=self.run_dir / f"{to}.json",
+                log_path=self.run_dir / "logs" / f"{to}.log",
+            )
+
+        handle = agent_config["_handle"]
+
+        full_instruction = instruction
+        if schema:
+            schema_desc = json.dumps(schema)
+            full_instruction += (
+                f"\n\nRespond with a JSON object with these keys and types: "
+                f"{schema_desc}"
+            )
+
+        response_text = await handle.run(full_instruction, timeout=timeout)
+
+        if schema is None:
+            return response_text
+
+        try:
+            return _extract_json(response_text)
+        except ValueError:
+            raise ValueError(
+                f"Agent '{to}' response was not valid JSON: "
+                f"{response_text[:200]}"
+            )
+
+    def cleanup(self) -> None:
+        """Terminate all agent sessions. Called on program exit."""
+        for name, config in self._agents.items():
+            handle = config.get("_handle")
+            if handle:
+                _log(f"Cleaning up agent '{name}'")
+                try:
+                    write_state(handle.state_path, {
+                        "name": name,
+                        "session_id": handle.session_id,
+                        "status": "stopped",
+                        "step_number": handle.step_count,
+                        "last_instruction": "",
+                        "cwd": handle.cwd,
+                        "pid": os.getpid(),
+                    })
+                except OSError:
+                    pass
 
     async def _wait_for_response(self, step_number: int) -> str:
         """Poll self.json for responded status matching step_number."""
