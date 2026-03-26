@@ -4,7 +4,7 @@
 
 **Goal:** Replace the single `step()` primitive with a three-function API (`auto.remind`, `auto.task`, `auto.agent`) that supports multi-agent orchestration via `claude -p` subprocesses.
 
-**Architecture:** The `auto` object wraps the existing stop-hook IPC for `remind()` (self-messaging) and adds `claude -p --resume` subprocess management for `task()` (delegation). Per-run folders in `.claude/auto/run-{ts}-{pid}/` replace the current flat file layout. The stop hook reads from `.claude/auto/latest/self.json` instead of `.claude/auto-loop.json`.
+**Architecture:** The `auto` object wraps the existing stop-hook IPC for `remind()` (self-messaging) and adds `claude -p --resume` subprocess management for `task()` (delegation). Per-run folders in `~/.auto/run-{ts}-{pid}/` (global, not project-local) replace the current flat file layout. The stop hook reads from `$HOME/.auto/latest/self.json` instead of `.claude/auto-loop.json`. State files never pollute the project directory.
 
 **Tech Stack:** Python 3.10+ stdlib only (asyncio, subprocess, json, tempfile). `claude` CLI for agent subprocesses. bash + jq for stop hook.
 
@@ -21,7 +21,7 @@
 | `src/auto/run_folder.py` | Create | Run folder creation, symlink, state file I/O |
 | `src/auto/step.py` | Modify | Extract shared logic (JSON extraction, polling), keep `run_program()` as compat wrapper |
 | `src/auto/cli.py` | Modify | New file layout paths, `auto-run log <agent>` arg, status shows all agents |
-| `src/auto/hooks/stop-hook.sh` | Modify | Read from `.claude/auto/latest/self.json` |
+| `src/auto/hooks/stop-hook.sh` | Modify | Read from `$HOME/.auto/latest/self.json` |
 | `src/auto/__init__.py` | Modify | Export new API |
 | `tests/test_core.py` | Create | Tests for `Auto` class |
 | `tests/test_agents.py` | Create | Tests for `AgentHandle` and `claude -p` subprocess management |
@@ -55,7 +55,7 @@ from auto.run_folder import create_run_folder, read_state, write_state
 class TestRunFolder:
     def test_create_run_folder_creates_structure(self, tmp_path):
         """Run folder has correct structure with logs/ subdir."""
-        run_dir = create_run_folder(tmp_path / ".claude" / "auto")
+        run_dir = create_run_folder(tmp_path / ".auto")
         assert run_dir.exists()
         assert (run_dir / "logs").is_dir()
         assert run_dir.name.startswith("run-")
@@ -65,7 +65,7 @@ class TestRunFolder:
 
     def test_create_run_folder_creates_latest_symlink(self, tmp_path):
         """latest symlink points to the new run folder."""
-        auto_dir = tmp_path / ".claude" / "auto"
+        auto_dir = tmp_path / ".auto"
         run_dir = create_run_folder(auto_dir)
         latest = auto_dir / "latest"
         assert latest.is_symlink()
@@ -73,7 +73,7 @@ class TestRunFolder:
 
     def test_create_run_folder_updates_latest_on_second_run(self, tmp_path):
         """Second run atomically replaces the latest symlink."""
-        auto_dir = tmp_path / ".claude" / "auto"
+        auto_dir = tmp_path / ".auto"
         run1 = create_run_folder(auto_dir)
         run2 = create_run_folder(auto_dir)
         latest = auto_dir / "latest"
@@ -121,11 +121,11 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'auto.run_folder'`
 # src/auto/run_folder.py
 """Run folder management for auto programs.
 
-Each program run gets its own folder:
-  .claude/auto/run-YYYYMMDD-HHMMSS-PID/
+Each program run gets its own folder under ~/.auto/ (global, not project-local):
+  ~/.auto/run-YYYYMMDD-HHMMSS-PID/
     self.json
     logs/
-  .claude/auto/latest -> run-YYYYMMDD-HHMMSS-PID/
+  ~/.auto/latest -> run-YYYYMMDD-HHMMSS-PID/
 """
 
 import json
@@ -139,7 +139,7 @@ def create_run_folder(auto_dir: Path) -> Path:
     """Create a timestamped run folder with logs/ subdir and latest symlink.
 
     Args:
-        auto_dir: The .claude/auto/ directory.
+        auto_dir: The ~/.auto/ directory.
 
     Returns:
         Path to the created run folder.
@@ -234,11 +234,11 @@ from auto.core import Auto
 
 class TestAutoInit:
     def test_auto_creates_run_folder(self, tmp_path):
-        """Auto() creates a run folder in .claude/auto/."""
-        auto = Auto(project_root=tmp_path)
+        """Auto() creates a run folder in ~/.auto/."""
+        auto = Auto(project_root=tmp_path, auto_dir=tmp_path / ".auto")
         assert auto.run_dir.exists()
         assert (auto.run_dir / "logs").is_dir()
-        assert (tmp_path / ".claude" / "auto" / "latest").is_symlink()
+        assert (tmp_path / ".auto" / "latest").is_symlink()
 
     def test_auto_self_state_path(self, tmp_path):
         """Auto stores self state in self.json."""
@@ -345,7 +345,8 @@ from auto.step import _extract_json, _log, POLL_INTERVAL
 class Auto:
     """Orchestration object passed to auto programs as `async def main(auto):`."""
 
-    def __init__(self, project_root: Path = None, session_id: str = ""):
+    def __init__(self, project_root: Path = None, session_id: str = "",
+                 auto_dir: Path = None):
         if project_root is None:
             project_root = Path.cwd()
         self._project_root = Path(project_root)
@@ -353,8 +354,9 @@ class Auto:
         self._pid = os.getpid()
         self._cwd = str(self._project_root.resolve())
 
-        # Create run folder
-        auto_dir = self._project_root / ".claude" / "auto"
+        # Create run folder in global ~/.auto/ (or override for tests)
+        if auto_dir is None:
+            auto_dir = Path.home() / ".auto"
         self.run_dir = create_run_folder(auto_dir)
         self._self_state_path = self.run_dir / "self.json"
 
@@ -566,20 +568,20 @@ class TestRunFolderIntegration:
         self._orig_auto_dir = getattr(cli_mod, "AUTO_DIR", None)
 
     def test_start_creates_run_folder(self, tmp_path, monkeypatch):
-        """auto-run program.py creates .claude/auto/run-{ts}-{pid}/."""
+        """auto-run program.py creates ~/.auto/run-{ts}-{pid}/."""
         monkeypatch.chdir(tmp_path)
         prog = tmp_path / "prog.py"
         prog.write_text("async def main(auto): pass\n")
         (tmp_path / ".claude").mkdir()
 
-        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".claude" / "auto"))
-        monkeypatch.setattr(cli_mod, "PID_FILE", str(tmp_path / ".claude" / "auto.pid"))
+        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".auto"))
+        monkeypatch.setattr(cli_mod, "PID_FILE", str(tmp_path / ".auto" / "auto.pid"))
 
         with patch.object(subprocess, "Popen", return_value=_mock_popen(111)):
             with patch.object(cli_mod, "_setup_hook"):
                 cli_mod._start_program(str(prog))
 
-        auto_dir = tmp_path / ".claude" / "auto"
+        auto_dir = tmp_path / ".auto"
         assert auto_dir.exists()
         latest = auto_dir / "latest"
         assert latest.is_symlink()
@@ -590,7 +592,7 @@ class TestStatusMultiAgent:
 
     def test_status_shows_agent_states(self, tmp_path, capsys, monkeypatch):
         """auto-run status reads all .json files in latest/."""
-        run_dir = tmp_path / ".claude" / "auto" / "run-20260326-150000-99999"
+        run_dir = tmp_path / ".auto" / "run-20260326-150000-99999"
         run_dir.mkdir(parents=True)
         (run_dir / "logs").mkdir()
 
@@ -608,11 +610,11 @@ class TestStatusMultiAgent:
             }))
 
         # Create latest symlink
-        latest = tmp_path / ".claude" / "auto" / "latest"
+        latest = tmp_path / ".auto" / "latest"
         os.symlink("run-20260326-150000-99999", latest)
 
-        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".claude" / "auto"))
-        monkeypatch.setattr(cli_mod, "PID_FILE", str(tmp_path / ".claude" / "auto.pid"))
+        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".auto"))
+        monkeypatch.setattr(cli_mod, "PID_FILE", str(tmp_path / ".auto" / "auto.pid"))
 
         cli_mod._show_status()
         output = capsys.readouterr().out
@@ -625,24 +627,24 @@ class TestLogWithAgentName:
 
     def test_tail_log_defaults_to_self(self, tmp_path, monkeypatch):
         """auto-run log with no args tails self.log."""
-        run_dir = tmp_path / ".claude" / "auto" / "run-test"
+        run_dir = tmp_path / ".auto" / "run-test"
         (run_dir / "logs").mkdir(parents=True)
         (run_dir / "logs" / "self.log").write_text("hello\n")
-        os.symlink("run-test", tmp_path / ".claude" / "auto" / "latest")
+        os.symlink("run-test", tmp_path / ".auto" / "latest")
 
-        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".claude" / "auto"))
+        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".auto"))
         # Just test the path resolution, not the actual tail
         log_path = Path(cli_mod.AUTO_DIR) / "latest" / "logs" / "self.log"
         assert log_path.exists()
 
     def test_tail_log_agent_name(self, tmp_path, monkeypatch):
         """auto-run log coder tails coder.log."""
-        run_dir = tmp_path / ".claude" / "auto" / "run-test"
+        run_dir = tmp_path / ".auto" / "run-test"
         (run_dir / "logs").mkdir(parents=True)
         (run_dir / "logs" / "coder.log").write_text("agent log\n")
-        os.symlink("run-test", tmp_path / ".claude" / "auto" / "latest")
+        os.symlink("run-test", tmp_path / ".auto" / "latest")
 
-        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".claude" / "auto"))
+        monkeypatch.setattr(cli_mod, "AUTO_DIR", str(tmp_path / ".auto"))
         log_path = Path(cli_mod.AUTO_DIR) / "latest" / "logs" / "coder.log"
         assert log_path.exists()
 ```
@@ -658,8 +660,8 @@ Update `src/auto/cli.py`:
 
 1. Replace constants at top:
 ```python
-AUTO_DIR = ".claude/auto"
-PID_FILE = ".claude/auto.pid"
+AUTO_DIR = os.path.join(str(Path.home()), ".auto")
+PID_FILE = os.path.join(str(Path.home()), ".auto", "auto.pid")
 ```
 
 2. In `_start_program()`: replace the log file creation with run folder creation. Use `create_run_folder()` to make the run directory, write logs to `run_dir/logs/self.log`.
@@ -677,7 +679,7 @@ In `src/auto/hooks/stop-hook.sh`, change line 6:
 # Old:
 STATE_FILE=".claude/auto-loop.json"
 # New:
-STATE_FILE=".claude/auto/latest/self.json"
+STATE_FILE="$HOME/.auto/latest/self.json"
 ```
 
 - [ ] **Step 5: Run tests to verify they pass**
@@ -794,7 +796,7 @@ async def main(auto):
 ```
 
 Run: `auto-run program_v2.py`
-Verify: logs appear in `.claude/auto/latest/logs/self.log`, state in `.claude/auto/latest/self.json`
+Verify: logs appear in `~/.auto/latest/logs/self.log`, state in `~/.auto/latest/self.json`
 
 - [ ] **Step 5: Test backward compat with v1 program**
 
@@ -1476,7 +1478,7 @@ git commit -m "test: add e2e tests for Auto.remind() flow"
 
 Add to `.gitignore`:
 ```
-.claude/auto/
+.auto/
 ```
 
 - [ ] **Step 2: Update program.py to v2 API**

@@ -64,7 +64,7 @@ The `auto` object provides `remind()`, `task()`, and `agent()`. Programs are pla
 
 - **Declaration:** `auto.agent("coder", cwd="/app")` stores config. No session is started yet.
 - **Lazy creation:** The agent's Claude Code session starts on the first `task(to="coder")` call.
-- **Persistence:** Same name = same session. Context accumulates across `task()` calls to the same agent. The first `claude -p` call returns a `session_id` (UUID) in its JSON output. This UUID is stored in `{name}.json` in the run folder. Subsequent calls use `claude -p --resume "{session_id}"` with the stored UUID.
+- **Persistence:** Same name = same session. Context accumulates across `task()` calls to the same agent. The first `claude -p` call returns a `session_id` (UUID) in its JSON output. This UUID is stored in `{name}.json` in the global run folder (`~/.auto/run-{ts}-{pid}/`). Subsequent calls use `claude -p --resume "{session_id}"` with the stored UUID.
 - **Undeclared agents:** `auto.task("do X", to="helper")` without a prior `agent("helper")` call creates one with default config. Forgiving by design — the LLM doesn't need to remember to declare.
 - **Redeclaration:** Calling `auto.agent("coder", ...)` a second time is a no-op. First declaration wins. To use different config, use a different name.
 - **Cleanup:** All agent subprocess PIDs are tracked in the run folder. On program exit (done, error, or SIGTERM), all tracked subprocesses are killed via SIGTERM. An `atexit` handler ensures cleanup even on unhandled exceptions.
@@ -101,8 +101,8 @@ No stop hook needed for `task` agents — `claude -p` is synchronous (blocks unt
 
 ```
 auto.remind("do X"):
-  Python  --[write pending]--> self.json --[hook reads]--> Claude TUI
-  Claude TUI --[hook writes responded]--> self.json --[Python reads]--> return
+  Python  --[write pending]--> ~/.auto/latest/self.json --[hook reads]--> Claude TUI
+  Claude TUI --[hook writes responded]--> ~/.auto/latest/self.json --[Python reads]--> return
 
 auto.task("do X", to="coder"):
   Python  --[read coder.json for session_id]
@@ -114,10 +114,12 @@ auto.task("do X", to="coder"):
 
 ## File Layout
 
+State and logs live in the **global** `~/.auto/` directory, not in the project. This prevents state files from polluting the project, being seen by agents, or being accidentally committed.
+
 Each program run gets its own folder:
 
 ```
-.claude/auto/
+~/.auto/
   run-20260326-150000-12345/       # {timestamp}-{pid}
     self.json                       # remind() state
     coder.json                      # task(to="coder") state
@@ -132,6 +134,7 @@ Each program run gets its own folder:
 - Old runs persist for debugging (never overwritten).
 - PID in folder name ties it to the process.
 - Symlink `latest/` lets CLI commands find the current run.
+- No project-local files — nothing to `.gitignore`.
 
 ### Agent State File Schema (`{name}.json`)
 
@@ -150,9 +153,11 @@ Each program run gets its own folder:
 
 For `self.json`, `session_id` is not used (IPC is via stop hook, not `claude -p`). The status field drives `auto-run status` output.
 
+All state files live under `~/.auto/`, resolved via `Path.home() / ".auto"` in Python and `$HOME/.auto` in bash.
+
 ### Migration from Current File Layout
 
-The current flat layout (`.claude/auto-loop.json`, `.claude/logs/`, `.claude/auto.pid`) is replaced by the per-run folder structure. The stop hook path in `stop-hook.sh` changes from the hardcoded `.claude/auto-loop.json` to `.claude/auto/latest/self.json`. The `latest` symlink ensures the hook always finds the current run. The old files are no longer written; existing programs using `step()` will use the new paths via the `auto.remind()` alias.
+The current project-local layout (`.claude/auto-loop.json`, `.claude/logs/`, `.claude/auto.pid`) is replaced by the global per-run folder structure in `~/.auto/`. The stop hook path in `stop-hook.sh` changes from the hardcoded `.claude/auto-loop.json` to `$HOME/.auto/latest/self.json`. The `latest` symlink ensures the hook always finds the current run. The old project-local files are no longer written; existing programs using `step()` will use the new paths via the `auto.remind()` alias.
 
 ## CLI
 
