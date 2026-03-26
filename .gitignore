@@ -2,6 +2,6 @@ __pycache__/
 *.egg-info/
 dist/
 .venv/
-auto.log
-.auto.pid
+.claude/logs/
+.claude/auto.pid
 .claude/auto-loop.json

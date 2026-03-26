@@ -17,7 +17,7 @@ def main():
         print("    auto-run <program.py>   Start an auto program in background")
         print("    auto-run setup          Install stop hook into .claude/settings.local.json")
         print("    auto-run status         Show running state and recent logs")
-        print("    auto-run log            Tail the auto.log file")
+        print("    auto-run log            Tail the latest log file (.claude/logs/auto.log)")
         print("    auto-run stop           Kill running program")
         print()
         print("Environment Variables:")
@@ -41,8 +41,9 @@ def main():
         sys.exit(1)
 
 
-PID_FILE = ".auto.pid"
-LOG_FILE = "auto.log"
+LOG_DIR = ".claude/logs"
+LOG_LINK = os.path.join(LOG_DIR, "auto.log")  # symlink to latest
+PID_FILE = ".claude/auto.pid"
 
 def _setup_hook():
     """Install the auto stop hook into .claude/settings.local.json."""
@@ -110,15 +111,19 @@ def _start_program(program_path):
 
     # Check if already running
     if os.path.isfile(PID_FILE):
-        with open(PID_FILE) as f:
-            old_pid = int(f.read().strip())
         try:
-            os.kill(old_pid, 0)
-            print(f"Error: Auto program already running (PID {old_pid})", file=sys.stderr)
-            print("Use 'auto-run stop' first", file=sys.stderr)
-            sys.exit(1)
-        except (ProcessLookupError, PermissionError):
-            os.remove(PID_FILE)
+            with open(PID_FILE) as f:
+                old_pid = int(f.read().strip())
+        except (ValueError, OSError):
+            Path(PID_FILE).unlink(missing_ok=True)
+        else:
+            try:
+                os.kill(old_pid, 0)
+                print(f"Error: Auto program already running (PID {old_pid})", file=sys.stderr)
+                print("Use 'auto-run stop' first", file=sys.stderr)
+                sys.exit(1)
+            except (ProcessLookupError, PermissionError):
+                Path(PID_FILE).unlink(missing_ok=True)
 
     program_path = os.path.abspath(program_path)
     cwd = os.getcwd()  # project root -- must match hook's working directory
@@ -126,9 +131,14 @@ def _start_program(program_path):
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
 
-    log_fh = open(LOG_FILE, "a")
-    proc = subprocess.Popen(
-        [sys.executable, "-c", f"""
+    # Per-run log file in .claude/logs/
+    os.makedirs(LOG_DIR, exist_ok=True)
+    run_log = os.path.join(LOG_DIR, f"auto-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log")
+
+    log_fh = open(run_log, "w")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-c", f"""
 import asyncio, importlib.util, sys, os
 # Set cwd to project root so state file resolves correctly
 os.chdir({cwd!r})
@@ -139,18 +149,37 @@ spec.loader.exec_module(mod)
 from auto.step import run_program
 asyncio.run(run_program(mod.main))
 """],
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        env=env,
-    )
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    except Exception:
+        log_fh.close()
+        raise
     log_fh.close()
 
+    # Atomic symlink: create temp, then rename over the real one
+    run_log_basename = os.path.basename(run_log)
+    tmp_link = run_log + ".lnk"
+    try:
+        os.symlink(run_log_basename, tmp_link)
+        os.rename(tmp_link, LOG_LINK)
+    except OSError:
+        # Fallback: non-atomic replace
+        try:
+            os.unlink(LOG_LINK)
+        except FileNotFoundError:
+            pass
+        os.symlink(run_log_basename, LOG_LINK)
+
+    Path(PID_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(PID_FILE, "w") as f:
         f.write(str(proc.pid))
 
     print(f"[auto] Started in background (PID {proc.pid})")
-    print(f"[auto] Logs: {LOG_FILE}")
+    print(f"[auto] Logs: {run_log}")
+    print(f"[auto] Latest: {LOG_LINK}")
 
     # Wait for Python to write any state (starting or pending) before printing
     # the "send go" message. run_program writes a "starting" heartbeat before
@@ -185,7 +214,7 @@ def _show_status():
                 print(f"Process: Running (PID {pid})")
             except (ProcessLookupError, PermissionError):
                 print(f"Process: Not running (stale PID {pid})")
-                os.remove(PID_FILE)
+                Path(PID_FILE).unlink(missing_ok=True)
     else:
         print("Process: Not running")
 
@@ -196,29 +225,36 @@ def _show_status():
     if os.path.isfile(ipc_state_file):
         with open(ipc_state_file) as f:
             print(f.read())
-    elif os.path.isfile("auto-state.json"):
-        with open("auto-state.json") as f:
-            print(f.read())
     else:
         print("No state file found")
 
     # Show recent logs
     print()
     print("=== Recent Log ===")
-    if os.path.isfile(LOG_FILE):
-        with open(LOG_FILE) as f:
+    if os.path.isfile(LOG_LINK):
+        target = os.path.realpath(LOG_LINK)
+        print(f"(from {target})")
+        with open(LOG_LINK) as f:
             lines = f.readlines()
             for line in lines[-10:]:
                 print(line, end="")
+    elif os.path.islink(LOG_LINK):
+        print(f"Symlink {LOG_LINK} exists but target is missing (deleted?)")
     else:
         print("No log file found")
 
 
 def _tail_log():
-    if not os.path.isfile(LOG_FILE):
-        print(f"Error: {LOG_FILE} not found", file=sys.stderr)
+    if os.path.isfile(LOG_LINK):
+        target = os.path.realpath(LOG_LINK)
+        print(f"(tailing {target})", file=sys.stderr)
+        os.execvp("tail", ["tail", "-n", "50", LOG_LINK])
+    elif os.path.islink(LOG_LINK):
+        print(f"Error: {LOG_LINK} symlink exists but target is missing", file=sys.stderr)
         sys.exit(1)
-    os.execvp("tail", ["tail", "-n", "50", LOG_FILE])
+    else:
+        print(f"Error: No log file found at {LOG_LINK}", file=sys.stderr)
+        sys.exit(1)
 
 
 def _stop_program():
@@ -231,12 +267,12 @@ def _stop_program():
             pid = int(f.read().strip())
     except (ValueError, OSError):
         print("Error: PID file corrupted. Removing it.", file=sys.stderr)
-        os.remove(PID_FILE)
+        Path(PID_FILE).unlink(missing_ok=True)
         return
 
     print(f"Stopping auto program (PID {pid})...")
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.killpg(pid, signal.SIGTERM)
         # Wait briefly
         for _ in range(10):
             time.sleep(1)
@@ -245,12 +281,12 @@ def _stop_program():
             except ProcessLookupError:
                 break
         else:
-            os.kill(pid, signal.SIGKILL)
+            os.killpg(pid, signal.SIGKILL)
         print("Program stopped")
     except ProcessLookupError:
         print("Process already stopped")
 
-    os.remove(PID_FILE)
+    Path(PID_FILE).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
