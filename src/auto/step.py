@@ -1,15 +1,9 @@
 """Auto: the step() primitive via Claude Code stop hook IPC.
 
 The Python program runs as a sidecar process alongside a Claude Code TUI session.
-Communication happens through .claude/auto-loop.json. A stop hook installed in
-the project's .claude/hooks.json intercepts Claude's turn endings and relays
+Communication happens through ~/.auto/latest/self.json. A stop hook installed in
+the project's settings intercepts Claude's turn endings and relays
 instructions/responses.
-
-IMPORTANT: auto-run MUST be invoked from the project root (the directory
-containing .claude/). The state file path .claude/auto-loop.json is resolved
-relative to the git repo root detected at startup. If run from a different
-directory, the hook (which runs in the project root) will not find the state
-file and the loop will never start.
 
     async def main(step):
         result = await step("run train.py, report loss")
@@ -52,8 +46,10 @@ def _find_repo_root() -> Path:
 
 
 def _state_file_path() -> Path:
-    """Resolve the state file path relative to the git repo root."""
-    return _find_repo_root() / ".claude" / "auto-loop.json"
+    """Resolve the state file path to ~/.auto/latest/self.json (matches stop-hook.sh)."""
+    auto_dir = Path.home() / ".auto" / "latest"
+    auto_dir.mkdir(parents=True, exist_ok=True)
+    return auto_dir / "self.json"
 
 
 # --- JSON extraction (preserved from current step.py) ---
@@ -259,11 +255,9 @@ async def _wait_for_response(step_number: int) -> str:
 async def run_program(program_fn):
     """Execute an auto program using stop-hook IPC.
 
-    Writes instructions to .claude/auto-loop.json and polls for responses.
+    Writes instructions to ~/.auto/latest/self.json and polls for responses.
     A stop hook installed in the Claude Code session reads these instructions
     and injects them as Claude's next turn.
-
-    MUST be run from the project root (directory containing .claude/).
 
     Args:
         program_fn: An async function that takes step as its argument.

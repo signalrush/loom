@@ -1,11 +1,11 @@
 ---
 name: auto
-description: Run yourself in a loop with branching logic via a Python program. Use for long-running tasks like optimization, research, iterative improvement, or any multi-step workflow where you need to repeat, branch, or track progress across 10+ turns. Triggers on "auto", "run a loop", "autoresearch", "keep improving", or when a program.py with def main(step) exists.
+description: Run yourself in a loop with branching logic via a Python program. Use for long-running tasks like optimization, research, iterative improvement, or any multi-step workflow where you need to repeat, branch, or track progress across 10+ turns. Triggers on "auto", "run a loop", "autoresearch", "keep improving", or when a program.py with def main(auto) exists.
 ---
 
 # Auto — Run yourself in a loop
 
-A Python program drives your turns. Each `step()` becomes YOUR next turn — you execute it with full tool access. The program controls the loop, branching, and state.
+A Python program drives your turns. Each `auto.remind()` becomes YOUR next turn — you execute it with full tool access. Use `auto.task()` to dispatch work to other agents. The program controls the loop, branching, and state.
 
 ## CRITICAL: How to launch
 
@@ -25,16 +25,16 @@ Then say **"go"** as your next message. That's it. The stop hook injects each st
 
 ```python
 # program.py
-async def main(step):
-    # Each step() is one of YOUR turns — you do the work
-    baseline = await step(
+async def main(auto):
+    # Each remind() is one of YOUR turns — you do the work
+    baseline = await auto.remind(
         "Run train.py and report val_loss",
         schema={"val_loss": "float"}
     )
     best = baseline["val_loss"]
 
     for i in range(20):
-        result = await step(
+        result = await auto.remind(
             f"Experiment {i+1}: try to beat val_loss={best}. "
             "Edit train.py, commit, run, report.",
             schema={"val_loss": "float", "description": "str"}
@@ -42,25 +42,33 @@ async def main(step):
 
         if result["val_loss"] < best:
             best = result["val_loss"]
-            await step(f"Good, improved to {best}. Keep it.")
+            await auto.remind(f"Good, improved to {best}. Keep it.")
         else:
-            await step("Didn't improve. Revert: git reset --hard HEAD~1")
+            await auto.remind("Didn't improve. Revert: git reset --hard HEAD~1")
 
         if (i + 1) % 5 == 0:
-            await step("Reflect: what's working? What to try next?")
+            await auto.remind("Reflect: what's working? What to try next?")
 ```
 
-No imports needed beyond the `step` function passed to `main`.
+No imports needed — the `auto` object is passed to `main`.
 
-## step() API
+## API
 
 ```python
-result = await step(instruction)              # returns str
-result = await step(instruction, schema={})   # returns dict
+result = await auto.remind(instruction)              # returns str
+result = await auto.remind(instruction, schema={})   # returns dict
+result = await auto.task(instruction, to="agent")    # dispatch to another agent
+auto.agent(name, cwd=None)                           # declare an agent
 ```
 
-- **instruction** (`str`): What to do. You execute this as a full turn.
-- **schema** (`dict`, optional): Forces structured JSON output. Keys are field names, values are type descriptions.
+### `auto.remind(instruction, schema=None, timeout=None)`
+Send yourself a message. Your session executes the instruction and returns the result.
+
+### `auto.task(instruction, to, schema=None, timeout=None)`
+Assign work to another agent via `claude -p` subprocess.
+
+### `auto.agent(name, cwd=None)`
+Declare an agent before first use. Optional — `task(to="name")` auto-creates agents.
 
 If JSON parsing fails, it retries up to 2 times automatically.
 
@@ -76,10 +84,10 @@ auto-run stop      # kill the program
 ```python
 from auto import state
 
-async def main(step):
+async def main(auto):
     state.set("status", "running")
     for i in range(100):
-        result = await step(f"experiment {i}", schema={"score": "float"})
+        result = await auto.remind(f"experiment {i}", schema={"score": "float"})
         state.update({"step": i, "score": result["score"]})
     state.set("status", "done")
 ```
@@ -90,35 +98,45 @@ Progress visible via `auto-run status` or `cat auto-state.json`.
 
 ### Optimization loop
 ```python
-async def main(step):
+async def main(auto):
     best = 999
     for i in range(20):
-        r = await step(f"Try to beat {best}", schema={"loss": "float"})
+        r = await auto.remind(f"Try to beat {best}", schema={"loss": "float"})
         if r["loss"] < best:
             best = r["loss"]
         else:
-            await step("Revert")
+            await auto.remind("Revert")
+```
+
+### Multi-agent
+```python
+async def main(auto):
+    auto.agent("researcher", cwd="/home/user/research")
+    auto.agent("coder", cwd="/home/user/project")
+
+    findings = await auto.task("Survey recent papers on X", to="researcher")
+    await auto.task(f"Implement based on: {findings}", to="coder")
 ```
 
 ### Error recovery
 ```python
-async def main(step):
+async def main(auto):
     for i in range(20):
         try:
-            r = await step(f"Experiment {i}", schema={"loss": "float"})
+            r = await auto.remind(f"Experiment {i}", schema={"loss": "float"})
         except Exception as e:
-            await step(f"Failed: {e}. Try a simpler approach.")
+            await auto.remind(f"Failed: {e}. Try a simpler approach.")
 ```
 
 ### Periodic reflection
 ```python
-async def main(step):
+async def main(auto):
     for i in range(100):
-        await step(f"Experiment {i}")
+        await auto.remind(f"Experiment {i}")
         if (i + 1) % 10 == 0:
-            await step("Reflect on last 10 experiments. Adjust strategy.")
+            await auto.remind("Reflect on last 10 experiments. Adjust strategy.")
 ```
 
 ## Key insight
 
-Each `step()` is YOUR full turn — you use all your tools (Bash, Read, Edit, etc.) to execute the instruction. The Python program decides what comes next based on your results. You keep full conversation memory across all steps.
+Each `auto.remind()` is YOUR full turn — you use all your tools (Bash, Read, Edit, etc.) to execute the instruction. `auto.task()` dispatches to other agents. The Python program decides what comes next based on results. You keep full conversation memory across all steps.

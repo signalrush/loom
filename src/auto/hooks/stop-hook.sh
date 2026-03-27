@@ -71,11 +71,11 @@ if [[ "$STATUS" == "running" ]]; then
       if [[ "$PREV_LINES" -ge 0 ]] && [[ "$TOTAL_LINES" -ge "$PREV_LINES" ]]; then
         LAST_OUTPUT=$(tail -n +"$((PREV_LINES + 1))" "$TRANSCRIPT_PATH" | jq -rs '
           [.[] | select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text] | join("\n")
-        ' 2>/dev/null)
+        ' 2>&1) || echo "[auto] Phase 1: jq FAILED parsing transcript (prev_lines=$PREV_LINES)" >&2
       else
         LAST_OUTPUT=$(tail -n 200 "$TRANSCRIPT_PATH" | jq -rs '
           [.[] | select(.type == "assistant") | .message.content[]? | select(.type == "text") | .text] | join("\n")
-        ' 2>/dev/null)
+        ' 2>&1) || echo "[auto] Phase 1: jq FAILED parsing transcript (tail -200)" >&2
       fi
 
       # If we got non-empty output, we're done

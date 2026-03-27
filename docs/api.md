@@ -1,25 +1,26 @@
 # API Reference
 
-## `async def main(step)`
+## `async def main(auto)`
 
-The main program pattern. Write a function that takes `step` as its argument. The `step` function sends instructions into your persistent session.
+The main program pattern. Write a function that takes `auto` as its argument. The `auto` object provides `remind()`, `task()`, and `agent()` for orchestrating work.
 
 ```python
-async def main(step):
-    result = await step("What files are in the current directory?")
+async def main(auto):
+    result = await auto.remind("What files are in the current directory?")
     print(result)
 ```
 
-## `step(instruction, schema=None)`
+## `auto.remind(instruction, schema=None, timeout=None)`
 
-The single primitive. Each call is one full agent turn in a persistent session where context accumulates.
+Send yourself a message. Your session executes the instruction and returns the result. Each call is one full agent turn in a persistent session where context accumulates.
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `instruction` | `str` | required | What to do. Natural language. |
-| `schema` | `dict \| None` | `None` | If provided, the step must return structured output matching this schema. Keys are field names, values are type descriptions. |
+| `schema` | `dict \| None` | `None` | If provided, forces structured JSON output. Keys are field names, values are type descriptions. |
+| `timeout` | `int \| None` | `None` | Seconds. Raises `TimeoutError` if exceeded. |
 
 ### Returns
 
@@ -29,12 +30,12 @@ The single primitive. Each call is one full agent turn in a persistent session w
 ### Examples
 
 ```python
-async def main(step):
+async def main(auto):
     # Simple instruction
-    result = await step("What files are in the current directory?")
+    result = await auto.remind("What files are in the current directory?")
 
     # With schema
-    result = await step(
+    result = await auto.remind(
         "Run the training script and report results.",
         schema={"loss": "float", "accuracy": "float", "epochs": "int"}
     )
@@ -43,29 +44,74 @@ async def main(step):
 
 ---
 
-## `run_program(program_fn, server_url=None, cwd=None)`
+## `auto.task(instruction, to, schema=None, timeout=None)`
 
-Executes an auto program by connecting to an OpenCode server and passing a `step` function to your main function.
+Assign work to another agent. That agent's Claude Code session (via `claude -p`) executes the instruction and returns the result.
 
 ### Parameters
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `program_fn` | `function` | required | Your main function that takes `step` as argument. Can be sync or async. |
-| `server_url` | `str` | `None` | OpenCode server URL. Defaults to `AUTO_SERVER_URL` env var or `http://localhost:54321`. |
-| `cwd` | `str` | `None` | Working directory for agent tool execution. Defaults to current directory. |
+| `instruction` | `str` | required | What to do. Natural language. |
+| `to` | `str` | required | Agent name. Must match a declared or implicitly created agent. |
+| `schema` | `dict \| None` | `None` | Same as `remind`. |
+| `timeout` | `int \| None` | `None` | Same as `remind`. |
+
+### Returns
+
+- **Without schema:** `str` — the agent's text response.
+- **With schema:** `dict` — parsed JSON matching the schema.
+
+### Examples
+
+```python
+async def main(auto):
+    auto.agent("tester", cwd="/home/user/project")
+
+    result = await auto.task("run all tests and report failures", to="tester")
+
+    result = await auto.task(
+        "benchmark the API endpoint",
+        to="tester",
+        schema={"rps": "float", "p99_ms": "float"}
+    )
+```
+
+---
+
+## `auto.agent(name, cwd=None)`
+
+Declare an agent before first use. Optional — calling `task(to="name")` without prior declaration creates an agent with default config.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `name` | `str` | required | Unique agent identifier. |
+| `cwd` | `str \| None` | `None` | Working directory for the agent's session. Defaults to program's cwd. |
+
+---
+
+## `run_program_v2(program_fn)`
+
+Executes an auto program using the Auto orchestration object.
+
+### Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `program_fn` | `function` | required | Your main function that takes `auto` as argument. Must be async. |
 
 ### Example
 
 ```python
-from auto import run_program
+from auto.step import run_program_v2
 
-async def main(step):
-    result = await step("Run tests and fix any failures.")
+async def main(auto):
+    result = await auto.remind("Run tests and fix any failures.")
     print(result)
 
-# Run the program
-await run_program(main)
+await run_program_v2(main)
 ```
 
 ---
@@ -74,11 +120,15 @@ await run_program(main)
 
 ### Persistent session across steps
 
-All `step()` calls operate within a single OpenCode session. Step 100 remembers everything from steps 1-99. Context accumulates naturally, while Python provides control flow and structured state management.
+All `remind()` calls operate within a single session. Step 100 remembers everything from steps 1-99. Context accumulates naturally, while Python provides control flow and structured state management.
 
 ### Tool access
 
-Inside a step, the model has full access to bash, file read/write, and any configured MCP servers. The caller doesn't manage tools — `step()` is a complete agent turn that accumulates context.
+Inside a remind, the model has full access to bash, file read/write, and any configured MCP servers. `remind()` is a complete agent turn that accumulates context.
+
+### Task isolation
+
+Each `task()` runs in a separate `claude -p` subprocess. Agents don't share context with each other or with the main session. Use the return value to relay information between agents.
 
 ### Schema extraction
 
@@ -88,8 +138,4 @@ When `schema` is provided, the runtime:
 2. Extracts JSON from the response (handles markdown fences, surrounding text)
 3. Parses and returns the structured object
 
-If the model's response doesn't contain valid JSON, a `ValueError` is raised.
-
-### Prompt echo handling
-
-The OpenCode SDK may echo the prompt as the first `AssistantMessage`. The runtime automatically discards this and uses only the model's actual response.
+If the model's response doesn't contain valid JSON, it retries up to 2 times before raising `ValueError`.
