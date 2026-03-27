@@ -173,6 +173,15 @@ else:
     with open(PID_FILE, "w") as f:
         f.write(str(proc.pid))
 
+    # Write PID -> run dir mapping so the hook can find the right run folder.
+    # The hook has the session_id but not the run dir; the CLI has the run dir
+    # but not the session_id. The PID file bridges them: hook finds the live PID,
+    # reads the run dir, then registers sessions/<session_id> for future lookups.
+    pids_dir = Path(AUTO_DIR) / "pids"
+    pids_dir.mkdir(parents=True, exist_ok=True)
+    with open(pids_dir / str(proc.pid), "w") as f:
+        f.write(str(run_dir))
+
     print(f"[auto] Started in background (PID {proc.pid})")
     print(f"[auto] Run folder: {run_dir}")
     print(f"[auto] Logs: {run_log}")
@@ -300,6 +309,8 @@ def _stop_program():
         print("Process already stopped")
 
     Path(PID_FILE).unlink(missing_ok=True)
+    # Clean up PID -> run dir mapping
+    (Path(AUTO_DIR) / "pids" / str(pid)).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

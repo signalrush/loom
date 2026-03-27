@@ -76,17 +76,15 @@ def _extract_json(text):
         end = text.rfind(end_char)
         if end == -1:
             continue
-        depth = 0
+        # Try json.loads from each opening brace/bracket to the last closing one.
+        # This avoids naive depth-counting which fails on unbalanced braces
+        # inside JSON string values (e.g. "missing { on line 5").
         for i in range(end, -1, -1):
-            if text[i] == end_char:
-                depth += 1
-            elif text[i] == start_char:
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[i:end + 1])
-                    except json.JSONDecodeError:
-                        break
+            if text[i] == start_char:
+                try:
+                    return json.loads(text[i:end + 1])
+                except json.JSONDecodeError:
+                    continue
 
     raise ValueError(f"Could not extract valid JSON from response: {text[:200]}")
 
@@ -273,7 +271,7 @@ async def run_program(program_fn):
     if session_id:
         _log(f"Session: {session_id}")
     else:
-        _log("WARNING: CLAUDE_CODE_SESSION_ID not set, session isolation disabled")
+        _log("Session ID not in env — hook will register on first invocation")
 
     step_count = 0
 
@@ -293,12 +291,6 @@ async def run_program(program_fn):
         "python_pid": pid,
         "cwd": cwd,
     })
-
-    # Register session -> run folder mapping for multi-program isolation
-    from auto.run_folder import register_session, unregister_session
-    auto_dir = Path.home() / ".auto"
-    # v1 uses ~/.auto/latest directly, register that as the run dir
-    register_session(auto_dir, session_id, auto_dir / "latest")
 
     async def step(instruction, schema=None, schema_strict=True):
         """Send an instruction to Claude and get the result.
@@ -438,8 +430,6 @@ async def run_program(program_fn):
             "python_pid": pid,
             "cwd": cwd,
         })
-    finally:
-        unregister_session(auto_dir, session_id)
 
 
 async def run_program_v2(program_fn):
@@ -466,7 +456,7 @@ async def run_program_v2(program_fn):
     # (matches v1 behavior). Without this, self.json doesn't exist until
     # the first remind() call, so the hook exits immediately if the program
     # starts with task() calls.
-    from auto.run_folder import write_state, register_session, unregister_session
+    from auto.run_folder import write_state
     write_state(auto._self_state_path, {
         "name": "self",
         "status": "starting",
@@ -479,11 +469,6 @@ async def run_program_v2(program_fn):
         "python_pid": pid,
         "cwd": str(auto._project_root),
     })
-
-    # Register session -> run folder mapping so the hook can find the right
-    # state file when multiple programs run concurrently.
-    auto_dir = Path.home() / ".auto"
-    register_session(auto_dir, session_id, auto.run_dir)
 
     def _handle_sigterm(signum, frame):
         raise SystemExit("Received SIGTERM")
@@ -515,7 +500,18 @@ async def run_program_v2(program_fn):
         import traceback
         _log(f"Program CRASHED: {type(e).__name__}: {e}")
         _log(f"Traceback:\n{traceback.format_exc()}")
+        write_state(auto._self_state_path, {
+            "name": "self",
+            "status": "error",
+            "session_id": session_id,
+            "step_number": auto._step_count,
+            "instruction": None,
+            "schema": None,
+            "response": None,
+            "error": f"{type(e).__name__}: {e}",
+            "python_pid": pid,
+            "cwd": str(auto._project_root),
+        })
         raise
     finally:
         auto.cleanup()
-        unregister_session(auto_dir, session_id)
